@@ -121,10 +121,12 @@ APP_NAME = "AdaptiveMusicPlayer"
 # browser and gets their own private session key (stored locally via
 # QSettings, never committed to source).
 #
-# Get your own pair at: https://www.last.fm/api/account/create
+# Read from environment variables rather than hardcoded so the repo itself
+# never contains a live key/secret. Get your own pair at:
+# https://www.last.fm/api/account/create
 # --------------------------------------------------------------------------
-LASTFM_API_KEY = "1f26c1d6246e28cb42dc19afa279f113"
-LASTFM_API_SECRET = "6f2b08cb8deda644a8d4d365a832ebc2"
+LASTFM_API_KEY = os.environ.get("LASTFM_API_KEY", "")
+LASTFM_API_SECRET = os.environ.get("LASTFM_API_SECRET", "")
 
 
 # --------------------------------------------------------------------------
