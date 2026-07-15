@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=RoPlayer
+Comment=Local music player
+Exec=my-music-player
+Icon=roplayer
+Type=Application
+Categories=AudioVideo;Player;
+StartupWMClass=RoPlayer
+Terminal=false
