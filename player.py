@@ -110,6 +110,8 @@ ARTIST_STATS_MAX_AGE_SECONDS = 1 * 86400
 ARTIST_BIO_MAX_AGE_SECONDS = 90 * 86400
 ORG_NAME = "RohanApps"
 APP_NAME = "AdaptiveMusicPlayer"
+APP_VERSION = "1.0.0"
+APP_REPO_URL = "https://github.com/rohanisawesome/RoPlayer"
 
 # --------------------------------------------------------------------------
 # Last.fm application identity.
@@ -773,6 +775,350 @@ class LastfmLoginDialog(QDialog):
 
 
 # --------------------------------------------------------------------------
+# Settings dialog
+# --------------------------------------------------------------------------
+class _DialogTitleBar(QWidget):
+    # Same drag-to-move behavior as the main window's CustomTitleBar (see
+    # that class), scaled down for a dialog - no search box/options
+    # button, since those are Library-specific and don't belong on a
+    # settings window's own header.
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("DialogTitleBar")
+        self.setFixedHeight(42)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            window_handle = self.window().windowHandle()
+            if window_handle is not None:
+                window_handle.startSystemMove()
+        super().mousePressEvent(event)
+
+
+class SettingsLinkButton(QPushButton):
+    # A plain QPushButton's :pressed QSS state is an instant, static
+    # color swap - this adds the same quick fading white click-pulse
+    # AlbumCardWidget uses elsewhere in this file for tactile "yep, that
+    # registered" feedback, layered on top of the button's own normal
+    # rendering via paintEvent.
+    def __init__(self, text: str, parent=None):
+        super().__init__(text, parent)
+        self._pulse = 0.0
+        self._pulse_anim = QPropertyAnimation(self, b"pulseValue", self)
+        self._pulse_anim.setDuration(260)
+        self._pulse_anim.setStartValue(1.0)
+        self._pulse_anim.setEndValue(0.0)
+        self._pulse_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.clicked.connect(self._play_click_pulse)
+
+    def _get_pulse(self) -> float:
+        return self._pulse
+
+    def _set_pulse(self, value: float):
+        self._pulse = value
+        self.update()
+
+    pulseValue = pyqtProperty(float, fget=_get_pulse, fset=_set_pulse)
+
+    def _play_click_pulse(self):
+        self._pulse_anim.stop()
+        self._pulse = 1.0
+        self._pulse_anim.start()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self._pulse > 0.0:
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(255, 255, 255, int(90 * self._pulse)))
+            painter.drawRoundedRect(self.rect(), 8, 8)
+            painter.end()
+
+
+class SettingsDialog(QDialog):
+    # A sidebar + stacked content area, deliberately built the same shape
+    # a "real" multi-section settings dialog would be (so adding a second
+    # tab later is just another sidebar entry + another stacked page) -
+    # but only "About" is actually populated for now. Nothing here talks
+    # to the rest of the app; it's read-only informational content.
+    # Same red as WinCloseButton's hover state elsewhere in this app - and
+    # what the actual bundled app icon (a red circle) already is - rather
+    # than introducing a second, unrelated accent color just for this
+    # dialog.
+    _ACCENT = "#E5484D"
+
+    def __init__(self, app_icon_pixmap: Optional[QPixmap], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Settings")
+        self.setFixedSize(760, 440)
+        # Frameless, with its own title bar built below - a native OS
+        # title bar (what a plain QDialog gets by default) looks
+        # visually disconnected from the rest of this app, which never
+        # uses one.
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+        self.setStyleSheet(f"""
+            QDialog {{ background-color: #17191f; border: 1px solid rgba(255,255,255,0.1); }}
+            QWidget#DialogTitleBar {{
+                background-color: rgba(255, 255, 255, 0.03);
+                border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+            }}
+            QLabel#DialogTitleBarText {{ font-size: 13px; font-weight: 700; color: rgba(255,255,255,0.85); }}
+            QLabel#DialogLogoMark {{
+                background-color: {self._ACCENT};
+                border-radius: 7px;
+                font-size: 13px;
+                font-weight: 700;
+                color: rgba(255,255,255,0.85);
+            }}
+            QPushButton#DialogCloseButton {{
+                background-color: transparent;
+                border: none;
+                border-radius: 6px;
+                padding: 0px;
+                font-size: 15px;
+                font-weight: 600;
+                color: rgba(255,255,255,0.7);
+            }}
+            QPushButton#DialogCloseButton:hover {{ background-color: {self._ACCENT}; color: #FFFFFF; }}
+            QLabel {{ color: #FFFFFF; }}
+            QListWidget {{
+                background-color: #121317;
+                border: none;
+                border-right: 1px solid rgba(255,255,255,0.06);
+                outline: none;
+                padding: 10px 0px;
+            }}
+            QListWidget::item {{
+                color: rgba(255,255,255,0.55);
+                font-weight: 600;
+                font-size: 12px;
+                padding: 8px 18px;
+                border: none;
+            }}
+            QListWidget::item:selected {{
+                background-color: rgba(255,255,255,0.06);
+                color: #FFFFFF;
+                border-left: 2px solid {self._ACCENT};
+            }}
+            QPushButton#SettingsLinkButton {{
+                background-color: rgba(255,255,255,0.05);
+                border: 1px solid rgba(255,255,255,0.08);
+                border-radius: 8px;
+                padding: 8px 12px;
+                text-align: left;
+                font-weight: 600;
+                font-size: 12px;
+                color: rgba(255,255,255,0.9);
+            }}
+            QPushButton#SettingsLinkButton:hover {{
+                background-color: rgba(255,255,255,0.14);
+            }}
+        """)
+
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
+        outer_layout.addWidget(self._build_title_bar())
+
+        body = QWidget(self)
+        layout = QHBoxLayout(body)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # Only "About" exists right now - a real single-item list rather
+        # than a set of disabled placeholder entries for sections that
+        # don't exist yet, which would just be promising features that
+        # aren't there.
+        sidebar = QListWidget(self)
+        sidebar.setFixedWidth(150)
+        sidebar.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        sidebar.addItem("About")
+        sidebar.setCurrentRow(0)
+        layout.addWidget(sidebar)
+
+        content = QWidget(self)
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(24, 20, 24, 20)
+        content_layout.addWidget(self._build_about_page(app_icon_pixmap))
+        layout.addWidget(content, stretch=1)
+
+        outer_layout.addWidget(body, stretch=1)
+
+    def _build_title_bar(self) -> QWidget:
+        bar = _DialogTitleBar(self)
+        bar_layout = QHBoxLayout(bar)
+        bar_layout.setContentsMargins(14, 6, 10, 6)
+        bar_layout.setSpacing(10)
+
+        logo_mark = QLabel("\u266a", bar)
+        logo_mark.setObjectName("DialogLogoMark")
+        logo_mark.setFixedSize(26, 26)
+        logo_mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        bar_layout.addWidget(logo_mark)
+
+        title_lbl = QLabel("Settings", bar)
+        title_lbl.setObjectName("DialogTitleBarText")
+        bar_layout.addWidget(title_lbl)
+        bar_layout.addStretch(1)
+
+        close_btn = QPushButton("\u00d7", bar)
+        close_btn.setObjectName("DialogCloseButton")
+        close_btn.setFixedSize(30, 26)
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        close_btn.clicked.connect(self.reject)
+        bar_layout.addWidget(close_btn)
+
+        return bar
+
+    def _build_about_page(self, app_icon_pixmap: Optional[QPixmap]) -> QWidget:
+        page = QWidget(self)
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        page_layout.setSpacing(14)
+
+        heading = QLabel("About", page)
+        heading.setStyleSheet("font-size: 15px; font-weight: 800; color: rgba(255,255,255,0.95);")
+        page_layout.addWidget(heading)
+
+        cards_row = QHBoxLayout()
+        cards_row.setSpacing(14)
+        cards_row.addWidget(self._build_app_info_card(app_icon_pixmap), stretch=1)
+        cards_row.addWidget(self._build_credits_card(), stretch=1)
+        page_layout.addLayout(cards_row)
+        page_layout.addStretch(1)
+
+        return page
+
+    def _build_card_container(self) -> tuple:
+        # Shared shell for both About cards - accent-colored left border,
+        # dark panel background, matching the app's general card language.
+        # Scoped to #SettingsCard specifically, not a bare "QWidget { }" -
+        # an unscoped type selector here cascades down to *every* child
+        # widget (including the link buttons below), silently overriding
+        # their own :hover styling from this dialog's stylesheet with the
+        # card's flat background/border instead.
+        card = QWidget(self)
+        card.setObjectName("SettingsCard")
+        card.setStyleSheet(f"""
+            QWidget#SettingsCard {{
+                background-color: rgba(255,255,255,0.03);
+                border: 1px solid rgba(255,255,255,0.06);
+                border-left: 2px solid {self._ACCENT};
+                border-radius: 8px;
+            }}
+        """)
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(16, 14, 16, 14)
+        card_layout.setSpacing(10)
+        return card, card_layout
+
+    def _open_repo_url(self, suffix: str = ""):
+        webbrowser.open(APP_REPO_URL + suffix)
+
+    def _build_app_info_card(self, app_icon_pixmap: Optional[QPixmap]) -> QWidget:
+        card, card_layout = self._build_card_container()
+
+        top_row = QHBoxLayout()
+        title_col = QVBoxLayout()
+        title_col.setSpacing(2)
+        title_lbl = QLabel("RoPlayer", card)
+        title_lbl.setStyleSheet("font-size: 16px; font-weight: 800; background: transparent; border: none;")
+        version_lbl = QLabel(f"v{APP_VERSION}", card)
+        version_lbl.setStyleSheet("font-size: 11px; color: rgba(255,255,255,0.45); background: transparent; border: none;")
+        title_col.addWidget(title_lbl)
+        title_col.addWidget(version_lbl)
+        top_row.addLayout(title_col)
+        top_row.addStretch(1)
+
+        if app_icon_pixmap is not None and not app_icon_pixmap.isNull():
+            icon_lbl = QLabel(card)
+            icon_lbl.setFixedSize(40, 40)
+            icon_lbl.setScaledContents(True)
+            rounded = app_icon_pixmap.scaled(
+                80, 80, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+            )
+            icon_lbl.setPixmap(rounded)
+            icon_lbl.setStyleSheet("background: transparent; border: none; border-radius: 20px;")
+            top_row.addWidget(icon_lbl)
+        card_layout.addLayout(top_row)
+
+        divider = QFrame(card)
+        divider.setFrameShape(QFrame.Shape.HLine)
+        divider.setStyleSheet(f"background-color: {self._ACCENT}; border: none; max-height: 1px;")
+        card_layout.addWidget(divider)
+
+        # Current year only, not a range starting from some guessed launch
+        # date this dialog has no way to actually know.
+        copyright_lbl = QLabel(f"Copyright \u00a9 {time.strftime('%Y')} Rohan", card)
+        copyright_lbl.setStyleSheet("font-size: 12px; color: rgba(255,255,255,0.75); background: transparent; border: none;")
+        card_layout.addWidget(copyright_lbl)
+
+        disclaimer_lbl = QLabel("This program comes with absolutely no warranty.", card)
+        disclaimer_lbl.setWordWrap(True)
+        disclaimer_lbl.setStyleSheet("font-size: 11px; color: rgba(255,255,255,0.45); background: transparent; border: none;")
+        card_layout.addWidget(disclaimer_lbl)
+
+        card_layout.addStretch(1)
+
+        website_btn = SettingsLinkButton("Open website", card)
+        website_btn.setObjectName("SettingsLinkButton")
+        website_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        website_btn.clicked.connect(lambda: self._open_repo_url())
+        card_layout.addWidget(website_btn)
+
+        return card
+
+    def _build_credits_card(self) -> QWidget:
+        card, card_layout = self._build_card_container()
+
+        title_lbl = QLabel("Credits", card)
+        title_lbl.setStyleSheet("font-size: 16px; font-weight: 800; background: transparent; border: none;")
+        card_layout.addWidget(title_lbl)
+
+        subtitle_lbl = QLabel("People and project links.", card)
+        subtitle_lbl.setStyleSheet("font-size: 11px; color: rgba(255,255,255,0.45); background: transparent; border: none;")
+        card_layout.addWidget(subtitle_lbl)
+
+        divider = QFrame(card)
+        divider.setFrameShape(QFrame.Shape.HLine)
+        divider.setStyleSheet(f"background-color: {self._ACCENT}; border: none; max-height: 1px;")
+        card_layout.addWidget(divider)
+
+        created_row = QHBoxLayout()
+        created_label = QLabel("Created by", card)
+        created_label.setStyleSheet("font-size: 12px; color: rgba(255,255,255,0.55); background: transparent; border: none;")
+        created_value = QLabel("Rohan", card)
+        created_value.setStyleSheet("font-size: 12px; font-weight: 700; color: #FFFFFF; background: transparent; border: none;")
+        created_row.addWidget(created_label)
+        created_row.addSpacing(6)
+        created_row.addWidget(created_value)
+        created_row.addStretch(1)
+        card_layout.addLayout(created_row)
+
+        card_layout.addStretch(1)
+
+        source_btn = SettingsLinkButton("Source code", card)
+        source_btn.setObjectName("SettingsLinkButton")
+        source_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        source_btn.clicked.connect(lambda: self._open_repo_url())
+        card_layout.addWidget(source_btn)
+
+        # "Report an Issue" rather than a "Contributors" link - this is a
+        # solo project as of this dialog being written, so a contributors
+        # page would just be empty; a real, useful link to the repo's
+        # issue tracker isn't.
+        issues_btn = SettingsLinkButton("Report an Issue", card)
+        issues_btn.setObjectName("SettingsLinkButton")
+        issues_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        issues_btn.clicked.connect(lambda: self._open_repo_url("/issues"))
+        card_layout.addWidget(issues_btn)
+
+        return card
+
+
+# --------------------------------------------------------------------------
 # Smooth Scrolling List View Helper
 # --------------------------------------------------------------------------
 class ControlledScrollListWidget(QListWidget):
@@ -950,8 +1296,31 @@ class AutoHeightIconGrid(ControlledScrollListWidget):
 
         grid = self.gridSize()
         spacing = self.spacing()
-        columns = max(1, (available_width + spacing) // (grid.width() + spacing))
-        rows = -(-count // columns)  # ceil division, no float rounding surprises
+
+        # Prefer asking Qt directly which row it actually placed the last
+        # item on, rather than recomputing columns ourselves from
+        # available_width - a manual "columns = available_width //
+        # cell_width" calculation and Qt's own internal icon-mode
+        # column-fitting can disagree by a few pixels (the same class of
+        # mismatch that caused the wheel-scroll bug elsewhere in this
+        # file), and disagreeing by even one column is enough to reserve
+        # height for a whole extra row here. That row then renders
+        # completely empty - only visible as a blank gap once a real row
+        # happens to fill exactly to the edge, which is why this only
+        # ever showed up intermittently rather than looking broken all
+        # the time.
+        last_rect = self.visualItemRect(self.item(count - 1))
+        if last_rect.height() > 0 and grid.height() > 0:
+            rows = round(last_rect.y() / grid.height()) + 1
+        else:
+            # Qt hasn't actually positioned items yet (e.g. right after
+            # addItem() but before a layout pass has run) - fall back to
+            # the manual estimate for this one call; the next real
+            # update_height() (resize, or another addItem-triggered call)
+            # will correct it once Qt's own layout has caught up.
+            columns = max(1, (available_width + spacing) // (grid.width() + spacing))
+            rows = -(-count // columns)  # ceil division, no float rounding surprises
+
         if self.max_rows is not None:
             rows = min(rows, self.max_rows)
         self.setFixedHeight(rows * grid.height() + spacing)
@@ -2250,12 +2619,14 @@ class TwoLineHeadingLabel(QLabel):
 class TopSongRow(QWidget):
     # One row in the artist detail panel's Top Songs list - rank, title,
     # a global Last.fm playcount, and (if this track is actually in the
-    # person's own library, not just popular on Last.fm) a click to play
-    # it. Deliberately a plain QWidget with its own mousePressEvent rather
-    # than a QPushButton - a button's built-in styling fights with wanting
+    # person's own library, not just popular on Last.fm) a double-click
+    # to play it - matching the double-click-to-play convention every
+    # other track/album card in this app already uses. Deliberately a
+    # plain QWidget with its own mouse event handlers rather than a
+    # QPushButton - a button's built-in styling fights with wanting
     # three independently-aligned pieces of text (rank/title/count) in one
     # row rather than a single centered label.
-    clicked = pyqtSignal()
+    doubleClicked = pyqtSignal()
 
     def __init__(self, rank: int, title: str, playcount_text: str, playable: bool, track_path: Optional[str] = None, parent=None):
         super().__init__(parent)
@@ -2307,10 +2678,10 @@ class TopSongRow(QWidget):
         # resize), not right when the track changed.
         self.update()
 
-    def mousePressEvent(self, event):
+    def mouseDoubleClickEvent(self, event):
         if self.playable and event.button() == Qt.MouseButton.LeftButton:
-            self.clicked.emit()
-        super().mousePressEvent(event)
+            self.doubleClicked.emit()
+        super().mouseDoubleClickEvent(event)
 
 
 class TopSongsHighlightOverlay(QWidget):
@@ -2389,6 +2760,7 @@ class AdaptiveMusicPlayer(QMainWindow):
         self.setMinimumSize(820, 560)
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
         app_icon_pixmap = self._build_app_icon()
+        self._app_icon_pixmap = app_icon_pixmap  # reused by SettingsDialog's About page
         self.setWindowIcon(QIcon(app_icon_pixmap))
         self._install_desktop_icon(app_icon_pixmap)
         self.settings = QSettings(ORG_NAME, APP_NAME)
@@ -2820,7 +3192,10 @@ class AdaptiveMusicPlayer(QMainWindow):
         self.options_menu.addAction(self.chromecast_action)
         # ============================
 
-
+        self.options_menu.addSeparator()
+        self.settings_action = QAction("Settings...", self)
+        self.settings_action.triggered.connect(self.open_settings_dialog)
+        self.options_menu.addAction(self.settings_action)
 
         self.options_menu.addSeparator()
         self.exit_action = QAction("Exit", self)
@@ -3847,11 +4222,12 @@ class AdaptiveMusicPlayer(QMainWindow):
                 rank, track.get("title", ""), playcount_text, playable=True,
                 track_path=track_path, parent=self.artist_top_songs_section,
             )
-            # Which of these two a click actually does is decided at click
-            # time (self.artist_top_songs_play_as_mix), not baked in here -
-            # toggling the mode shouldn't require rebuilding this whole
-            # list, just change what happens on the next click.
-            row.clicked.connect(
+            # Which of these two a double-click actually does is decided
+            # at click time (self.artist_top_songs_play_as_mix), not
+            # baked in here - toggling the mode shouldn't require
+            # rebuilding this whole list, just change what happens on the
+            # next click.
+            row.doubleClicked.connect(
                 lambda tp=track_path, ak=album_key, mk=mix_key: self._browse_to_track(
                     mk if self.artist_top_songs_play_as_mix else ak, tp, autoplay=True
                 )
@@ -5741,6 +6117,10 @@ class AdaptiveMusicPlayer(QMainWindow):
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.status_label.setText("Last.fm session connected and verified successfully!")
             self.status_label.setVisible(True)
+
+    def open_settings_dialog(self):
+        dialog = SettingsDialog(getattr(self, "_app_icon_pixmap", None), self)
+        dialog.exec()
 
     def _get_lastfm_credentials(self):
         """Shared credential/settings check used by both now-playing and scrobble calls."""
