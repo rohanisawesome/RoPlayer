@@ -2257,10 +2257,17 @@ class TopSongRow(QWidget):
     # row rather than a single centered label.
     clicked = pyqtSignal()
 
-    def __init__(self, rank: int, title: str, playcount_text: str, playable: bool, parent=None):
+    def __init__(self, rank: int, title: str, playcount_text: str, playable: bool, track_path: Optional[str] = None, parent=None):
         super().__init__(parent)
         self.playable = playable
+        self.track_path = track_path
         self.setObjectName("TopSongRow")
+        # A plain QWidget doesn't paint a QSS background-color at all
+        # unless this is set - without it, the :hover and [nowPlaying="1"]
+        # rules below were being matched correctly (the property really
+        # was being set) but their background-color was never actually
+        # getting painted, no matter how the widget was told to repaint.
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(6, 5, 6, 5)
         layout.setSpacing(10)
@@ -2282,10 +2289,74 @@ class TopSongRow(QWidget):
             self.setCursor(Qt.CursorShape.PointingHandCursor)
             self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
 
+    def set_now_playing(self, is_playing: bool):
+        # Same setProperty + unpolish/polish dance the nav tab buttons use
+        # elsewhere in this file to drive QSS off a dynamic state, rather
+        # than a paintEvent override like NowPlayingListWidget's animated
+        # sweep (see that class) - this is a short, static list of rows
+        # that doesn't need that sweep animation, just the same highlight
+        # color/radius and bold text it settles into.
+        self.setProperty("nowPlaying", "1" if is_playing else "0")
+        self.style().unpolish(self)
+        self.style().polish(self)
+        # unpolish/polish alone updates the *style cache* but doesn't
+        # reliably force an immediate repaint on a plain QWidget the way
+        # it tends to for standard controls - without this, the row was
+        # only actually redrawing with its new state the next time
+        # something else happened to trigger a repaint (a hover, a
+        # resize), not right when the track changed.
+        self.update()
+
     def mousePressEvent(self, event):
         if self.playable and event.button() == Qt.MouseButton.LeftButton:
             self.clicked.emit()
         super().mousePressEvent(event)
+
+
+class TopSongsHighlightOverlay(QWidget):
+    # A sliding highlight pill for the Top Songs list, mirroring
+    # NowPlayingListWidget's animated sweep above - same rgba(255,255,255,
+    # 36) fill, same 8px radius, same 260ms OutCubic glide. That class
+    # draws its highlight straight into its own paintEvent because
+    # everything it's highlighting is a QListWidgetItem inside one single
+    # view it already controls painting for. TopSongRow instances are
+    # plain sibling QWidgets in a QVBoxLayout instead, with no single view
+    # to hook a paintEvent onto - so this is a real floating child widget
+    # that gets lowered behind the rows (so their text stays legible on
+    # top of it) and animated via Qt's own geometry property instead.
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._anim: Optional[QPropertyAnimation] = None
+        self.hide()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(255, 255, 255, 36))
+        painter.drawRoundedRect(self.rect(), 8, 8)
+        painter.end()
+
+    def move_to(self, target_rect: QRect, animate: bool = True):
+        if self._anim is not None and self._anim.state() == QPropertyAnimation.State.Running:
+            self._anim.stop()
+        self.show()
+        self.lower()
+        if not animate or self.geometry().isEmpty():
+            # No previous position to glide from - either the very first
+            # highlight since this list was (re)built, or an explicit
+            # non-animated snap (e.g. resuming a paused track rather than
+            # actually advancing to it).
+            self.setGeometry(target_rect)
+            return
+        anim = QPropertyAnimation(self, b"geometry", self)
+        anim.setDuration(260)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        anim.setStartValue(self.geometry())
+        anim.setEndValue(target_rect)
+        self._anim = anim
+        anim.start()
 
 
 class AdaptiveMusicPlayer(QMainWindow):
@@ -2398,6 +2469,11 @@ class AdaptiveMusicPlayer(QMainWindow):
         # filter_library_by_artist/clear_artist_filter). None the rest
         # of the time.
         self.artist_filter_name: Optional[str] = None
+        # Whether clicking a Top Songs row plays it as part of a loopable
+        # "Top 10" mix (True) or jumps into that track's real album
+        # (False) - see _toggle_artist_top_songs_play_mode. Persisted so
+        # it's remembered across launches.
+        self.artist_top_songs_play_as_mix = self.settings.value("artist_top_songs_play_as_mix", "true") == "true"
         # normalize_track_title(title) -> (album_key, track_path) for the
         # artist currently showing in the detail panel - rebuilt fresh
         # each time by filter_library_by_artist(); see
@@ -3005,10 +3081,10 @@ class AdaptiveMusicPlayer(QMainWindow):
         # Builds the mixed track/album Jump Back In bar. A singular track
         # you've been playing on repeat surfaces as its own track card; an
         # album you've been working through track-by-track surfaces as an
-        # album card instead. Both kinds are ranked together by recent
-        # play count (ties broken by recency) so the bar reads left to
-        # right as "what you're most into right now" regardless of
-        # whether that's one song or a whole record.
+        # album card instead. Both kinds are ranked together by how
+        # recently they qualified (play count only breaks a tie) so the
+        # bar reads left to right as "what you were most recently into"
+        # regardless of whether that's one song or a whole record.
         #
         # Returns a list of dicts: {"mode": "track"|"album", "album_key",
         # "track_path" (only for "track")}.
@@ -3077,7 +3153,13 @@ class AdaptiveMusicPlayer(QMainWindow):
         ]
 
         combined = album_candidates + track_candidates
-        combined.sort(key=lambda e: (e["score"], e["recent_ts"]), reverse=True)
+        # Recency first, not score first - "you seem pretty sad" from
+        # earlier this week shouldn't sit ahead of something you only
+        # just crossed the replay threshold on today just because it has
+        # a couple more total plays within the window. score only breaks
+        # a tie between two entries whose most recent qualifying play
+        # landed at the exact same moment, which in practice is rare.
+        combined.sort(key=lambda e: (e["recent_ts"], e["score"]), reverse=True)
         return combined[:self.JUMP_BACK_IN_LIMIT]
 
     def _set_mix(self, key: str, title: str, subtitle: str, style: str, track_paths: list):
@@ -3741,12 +3823,17 @@ class AdaptiveMusicPlayer(QMainWindow):
         # was built alongside in filter_library_by_artist) - the whole
         # section just stays hidden if there's no overlap at all, rather
         # than showing a list of songs that can't actually be played here.
+        self.artist_top_songs_highlight.hide()
+        self.artist_top_songs_highlight.setGeometry(QRect())
         while self.artist_top_songs_rows_layout.count():
             item = self.artist_top_songs_rows_layout.takeAt(0)
             widget = item.widget()
             if widget is not None:
                 widget.deleteLater()
 
+        artist_name = self.artist_filter_name
+        mix_key = self._artist_top_songs_mix_key(artist_name) if artist_name else None
+        matched_paths = []
         rank = 0
         for track in tracks:
             match = self._artist_top_songs_track_index.get(normalize_track_title(track.get("title", "")))
@@ -3754,14 +3841,136 @@ class AdaptiveMusicPlayer(QMainWindow):
                 continue
             rank += 1
             album_key, track_path = match
+            matched_paths.append(track_path)
             playcount_text = f"{format_stat_count(track.get('playcount', ''))} plays"
-            row = TopSongRow(rank, track.get("title", ""), playcount_text, playable=True, parent=self.artist_top_songs_section)
-            row.clicked.connect(lambda ak=album_key, tp=track_path: self._browse_to_track(ak, tp, autoplay=True))
+            row = TopSongRow(
+                rank, track.get("title", ""), playcount_text, playable=True,
+                track_path=track_path, parent=self.artist_top_songs_section,
+            )
+            # Which of these two a click actually does is decided at click
+            # time (self.artist_top_songs_play_as_mix), not baked in here -
+            # toggling the mode shouldn't require rebuilding this whole
+            # list, just change what happens on the next click.
+            row.clicked.connect(
+                lambda tp=track_path, ak=album_key, mk=mix_key: self._browse_to_track(
+                    mk if self.artist_top_songs_play_as_mix else ak, tp, autoplay=True
+                )
+            )
             self.artist_top_songs_rows_layout.addWidget(row)
             if rank >= 10:
                 break
 
+        if mix_key:
+            self._set_mix(
+                mix_key, f"{artist_name} \u2014 Top Songs", "Their most popular tracks", "artist_top", matched_paths
+            )
         self.artist_top_songs_section.setVisible(rank > 0)
+        self._refresh_top_songs_now_playing(animate=False)
+
+    def _artist_top_songs_mix_key(self, artist_name: str) -> str:
+        return f"__mix__artist_top__{artist_name.lower()}"
+
+    def _toggle_artist_top_songs_play_mode(self):
+        self.artist_top_songs_play_as_mix = not self.artist_top_songs_play_as_mix
+        self.settings.setValue("artist_top_songs_play_as_mix", "true" if self.artist_top_songs_play_as_mix else "false")
+        self._update_artist_top_songs_mode_button()
+        self._resync_now_playing_top_song_context()
+
+    def _resync_now_playing_top_song_context(self):
+        # If the track actually playing right now is one of this artist's
+        # Top Songs, switches it into whichever context (mix vs its real
+        # album) the toggle was just switched to - without this, flipping
+        # the toggle only changed what happens the *next* time you click a
+        # row, not what you're already listening to, which read as the
+        # toggle just not working for whatever happened to be playing when
+        # you touched it.
+        if not (0 <= self.current_track_index < len(self.active_playing_tracks)):
+            return
+        current_path = self.active_playing_tracks[self.current_track_index]
+        match = next(
+            (
+                (album_key, track_path)
+                for album_key, track_path in self._artist_top_songs_track_index.values()
+                if track_path == current_path
+            ),
+            None,
+        )
+        if match is None:
+            return
+        album_key, track_path = match
+        mix_key = self._artist_top_songs_mix_key(self.artist_filter_name) if self.artist_filter_name else None
+        target_key = mix_key if self.artist_top_songs_play_as_mix else album_key
+        if target_key == self.active_playing_album_key:
+            return  # already in the context being toggled to - nothing to change
+
+        # Only re-labels which album/mix this already-playing track is
+        # considered part of (for next/prev/loop and the track panel) -
+        # deliberately never touches self.player at all. The exact same
+        # file keeps playing either way; routing this through
+        # play_track_at would reload it from scratch via setSource(),
+        # which is what was causing an audible blip on toggle even though
+        # nothing about the actual audio needed to change. Scrobble state
+        # (current_scrobbled, current_track_start_ts, the Last.fm "now
+        # playing" ping) is left alone for the same reason - this isn't a
+        # new play starting, just a relabel of an ongoing one.
+        new_tracks = self.album_tracks.get(target_key, [])
+        if track_path not in new_tracks:
+            return
+        self.browsing_album_key = target_key
+        self.browsing_tracks = new_tracks
+        self._start_playing_browsed_album()
+        self.current_track_index = new_tracks.index(track_path)
+
+        meta = self.album_display_meta.get(target_key, {})
+        self.album_heading.setText(f"{meta.get('title', '')} \u2014 {meta.get('artist', '')}")
+        self.song_list_widget.clear()
+        for path in new_tracks:
+            self.song_list_widget.addItem(self.get_track_title(path))
+        self.song_list_widget.set_now_playing_row(self.current_track_index, animate=False)
+        self._refresh_top_songs_now_playing(animate=False)
+        self._mpris_notify({"Metadata": self.mpris_metadata()})
+
+    def _update_artist_top_songs_mode_button(self):
+        if self.artist_top_songs_play_as_mix:
+            self.artist_top_songs_mode_btn.setText("\U0001F500 Playing as Mix")
+            self.artist_top_songs_mode_btn.setToolTip(
+                "Clicking a song plays it as part of a loopable Top 10 mix.\nClick to switch to playing from its album instead."
+            )
+        else:
+            self.artist_top_songs_mode_btn.setText("\U0001F4BF Playing from Album")
+            self.artist_top_songs_mode_btn.setToolTip(
+                "Clicking a song jumps into its real album, like any other track.\nClick to switch to a loopable Top 10 mix instead."
+            )
+
+    def _refresh_top_songs_now_playing(self, animate: bool = True):
+        # Highlights whichever Top Songs row (if any) matches the track
+        # actually playing right now - called both when the list itself
+        # is rebuilt (_render_artist_top_songs, always animate=False - see
+        # there) and whenever playback moves to a different track
+        # (play_track_at, animate=autoplay - same convention
+        # NowPlayingListWidget's own set_now_playing_row call uses), so it
+        # stays correct whether the track started playing from this list,
+        # from the album grid above it, or from anywhere else entirely.
+        if not hasattr(self, "artist_top_songs_rows_layout"):
+            return
+        current_path = None
+        if 0 <= self.current_track_index < len(self.active_playing_tracks):
+            current_path = self.active_playing_tracks[self.current_track_index]
+
+        target_row = None
+        for i in range(self.artist_top_songs_rows_layout.count()):
+            widget = self.artist_top_songs_rows_layout.itemAt(i).widget()
+            if not isinstance(widget, TopSongRow):
+                continue
+            is_match = current_path is not None and widget.track_path == current_path
+            widget.set_now_playing(is_match)
+            if is_match:
+                target_row = widget
+
+        if target_row is not None:
+            self.artist_top_songs_highlight.move_to(target_row.geometry(), animate=animate)
+        else:
+            self.artist_top_songs_highlight.hide()
 
     def generate_artist_avatar_pixmap(self, name: str, size: int = COVER_SIZE) -> QPixmap:
         # Placeholder shown before a real photo's been fetched (or if the
@@ -4002,12 +4211,30 @@ class AdaptiveMusicPlayer(QMainWindow):
         top_songs_layout = QVBoxLayout(self.artist_top_songs_section)
         top_songs_layout.setContentsMargins(2, 20, 2, 4)
         top_songs_layout.setSpacing(6)
+        top_songs_header_row = QHBoxLayout()
         top_songs_heading = QLabel("Top Songs", self)
         top_songs_heading.setObjectName("PinnedSectionHeading")
-        top_songs_layout.addWidget(top_songs_heading)
+        top_songs_header_row.addWidget(top_songs_heading)
+        top_songs_header_row.addStretch(1)
+        # Toggles whether clicking a row plays it as part of a loopable
+        # "Top 10" mix, or jumps into that track's real album like any
+        # other track card would - see _toggle_artist_top_songs_play_mode/
+        # _render_artist_top_songs. Persisted so the choice sticks across
+        # launches rather than resetting to the default every time.
+        self.artist_top_songs_mode_btn = QPushButton(self)
+        self.artist_top_songs_mode_btn.setObjectName("TopSongsModeButton")
+        self.artist_top_songs_mode_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.artist_top_songs_mode_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.artist_top_songs_mode_btn.clicked.connect(self._toggle_artist_top_songs_play_mode)
+        top_songs_header_row.addWidget(self.artist_top_songs_mode_btn)
+        top_songs_layout.addLayout(top_songs_header_row)
+        self._update_artist_top_songs_mode_button()
         self.artist_top_songs_rows_layout = QVBoxLayout()
         self.artist_top_songs_rows_layout.setSpacing(0)
         top_songs_layout.addLayout(self.artist_top_songs_rows_layout)
+        # A floating sibling of the row widgets above, not part of the
+        # layout itself - see TopSongsHighlightOverlay for why.
+        self.artist_top_songs_highlight = TopSongsHighlightOverlay(self.artist_top_songs_section)
         self.artist_top_songs_section.setVisible(False)
 
         scroll_content = QWidget()
@@ -4373,7 +4600,10 @@ class AdaptiveMusicPlayer(QMainWindow):
 
         if self.selected_cards:
             for card in self.selected_cards:
-                card.set_accent(self._current_accent)
+                try:
+                    card.set_accent(self._current_accent)
+                except RuntimeError:
+                    pass  # already destroyed by a grid rebuild since it was selected
         self._push_accent_to_now_playing_cards()
 
         self.setStyleSheet(f"""
@@ -4420,9 +4650,23 @@ class AdaptiveMusicPlayer(QMainWindow):
                 padding: 3px 10px;
                 font-size: 10px;
             }}
+            QPushButton#TopSongsModeButton {{
+                background-color: rgba(255, 255, 255, 0.06);
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 10px;
+                padding: 3px 10px;
+                font-size: 10px;
+                color: rgba(255,255,255,0.7);
+            }}
+            QPushButton#TopSongsModeButton:hover {{
+                background-color: rgba(255, 255, 255, 0.1);
+            }}
             QWidget#TopSongRow:hover {{
                 background-color: rgba(255, 255, 255, 0.05);
                 border-radius: 6px;
+            }}
+            QWidget#TopSongRow[nowPlaying="1"] QLabel#TopSongTitle {{
+                font-weight: 800;
             }}
             QLabel#TopSongRank {{
                 font-weight: 600; font-size: 12px; color: rgba(255,255,255,0.4);
@@ -4730,6 +4974,7 @@ class AdaptiveMusicPlayer(QMainWindow):
         "weekend_mix":         ("\u2726", QColor(0, 160, 150), QColor(0, 78, 110)),    # sparkle - teal
         "album_rewind":        ("\u27F2", QColor(150, 96, 56), QColor(64, 38, 28)),    # circular arrow - vinyl brown
         "month_rewind":        ("\u2605", QColor(186, 58, 186), QColor(58, 20, 88)),   # star - wrapped magenta
+        "artist_top":          ("\u2605", QColor(180, 140, 40), QColor(80, 56, 12)),   # star - gold, an artist's own Top Songs mix
     }
 
     def generate_mix_cover_pixmap(self, style: str = "replay", size: int = COVER_SIZE, radius: int = 8) -> QPixmap:
@@ -5217,7 +5462,10 @@ class AdaptiveMusicPlayer(QMainWindow):
         # permanently stuck showing their selected border, with nothing
         # left able to find and turn it back off.
         for card in self.selected_cards:
-            card.set_selected(False)
+            try:
+                card.set_selected(False)
+            except RuntimeError:
+                pass  # already destroyed by a grid rebuild since it was selected
         self.selected_cards = []
 
     def set_selected_card(self, card: AlbumCardWidget):
@@ -5280,6 +5528,7 @@ class AdaptiveMusicPlayer(QMainWindow):
         if autoplay:
             self._start_playing_browsed_album()
             self.play_track_at(target_row)
+        return target_row
 
     def _play_card(self, card: AlbumCardWidget):
         # Shared by Home's "single click plays immediately" cards and
@@ -5342,6 +5591,7 @@ class AdaptiveMusicPlayer(QMainWindow):
 
         if self.browsing_album_key == self.active_playing_album_key:
             self.song_list_widget.set_now_playing_row(row, animate=autoplay)
+        self._refresh_top_songs_now_playing(animate=autoplay)
 
         self.player.setSource(QUrl.fromLocalFile(path))
         if resume_position_ms > 0:
