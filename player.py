@@ -19,6 +19,7 @@ import time
 import random
 import math
 import hashlib
+import uuid
 import webbrowser
 from typing import Optional
 import urllib.request
@@ -34,18 +35,18 @@ from PyQt6.QtWidgets import (
     QAbstractItemView, QLineEdit, QGraphicsDropShadowEffect, QMenu,
     QStackedWidget, QGraphicsOpacityEffect, QDialog, QFormLayout,
     QDialogButtonBox, QCheckBox, QMessageBox, QProxyStyle, QStyle, QProgressBar,
-    QScrollArea, QFrame
+    QScrollArea, QFrame, QInputDialog
 )
 
 from PyQt6.QtCore import (
     Qt, QUrl, QSize, QRect, QRectF, QPointF, QThread, pyqtSignal, QObject,
     QSettings, QPropertyAnimation, QVariantAnimation, QEasingCurve,
-    pyqtProperty, QTimer, QPoint, QStandardPaths, QEvent
+    pyqtProperty, QTimer, QPoint, QStandardPaths, QEvent, QBuffer, QIODevice
 )
 
 from PyQt6.QtGui import (
     QPixmap, QIcon, QColor, QImage, QPainter, QPainterPath, QShortcut, 
-    QKeySequence, QAction, QPen, QFont, QCursor, QFontMetrics, QLinearGradient
+    QKeySequence, QAction, QActionGroup, QPen, QFont, QCursor, QFontMetrics, QLinearGradient
 )
 
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
@@ -2684,6 +2685,137 @@ class TopSongRow(QWidget):
         super().mouseDoubleClickEvent(event)
 
 
+class ElidingLabel(QLabel):
+    # A single-line QLabel that keeps its text elided ("...") to fit
+    # whatever width it's actually given, instead of either wrapping or
+    # getting silently clipped mid-character. Used for QueueTrackRowWidget's
+    # title/artist text below, where each row's real width isn't known
+    # ahead of time - it's whatever the containing list widget's viewport
+    # happens to be, which changes with the window.
+    def __init__(self, text: str = "", parent=None):
+        super().__init__("", parent)
+        self._full_text = ""
+        self.setWordWrap(False)
+        if text:
+            self.setText(text)
+
+    def setText(self, text: str):
+        self._full_text = text
+        self._relayout()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._relayout()
+
+    def _relayout(self):
+        width = self.width()
+        if width <= 0:
+            # Not laid out yet - show the full text for now, resizeEvent
+            # will redo this properly once real geometry is known.
+            super().setText(self._full_text)
+            return
+        super().setText(self.fontMetrics().elidedText(self._full_text, Qt.TextElideMode.ElideRight, width))
+
+
+class QueueTrackRowWidget(QWidget):
+    # A single row in the Queue view's "Next in Queue"/"Next from X" lists -
+    # small cover art + title + artist, the same "track row" shape the Now
+    # Playing card above them (and most streaming apps' queue screens) use,
+    # instead of a bare text line. Paints its own hover highlight and a
+    # brief click-pulse flash, the same visual language AlbumCardWidget
+    # uses for its grid cards, so these rows feel consistent with the rest
+    # of the app instead of like a plain, static list.
+    def __init__(self, pixmap: QPixmap, title: str, artist: str, parent=None):
+        super().__init__(parent)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        self._hovered = False
+
+        self._pulse = 0.0
+        self._pulse_anim = QPropertyAnimation(self, b"pulseValue", self)
+        self._pulse_anim.setDuration(260)
+        self._pulse_anim.setStartValue(1.0)
+        self._pulse_anim.setEndValue(0.0)
+        self._pulse_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(6, 6, 12, 6)
+        layout.setSpacing(10)
+
+        art_label = QLabel(self)
+        art_label.setFixedSize(40, 40)
+        art_label.setObjectName("QueueRowArt")
+        # Without this, a QLabel isn't guaranteed to actually paint its
+        # QSS background-color (the rgba(255,255,255,0.08) "bezel" behind
+        # the rounded corners) - same fix TopSongRow needs for its own
+        # QSS-driven background elsewhere in this file.
+        art_label.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        art_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # No setScaledContents - the pixmap handed in is already pre-
+        # cropped/rounded to this exact 40x40 size (see
+        # _queue_row_art_pixmap), so there's nothing left to scale;
+        # leaving scaling off avoids any chance of Qt re-stretching an
+        # already-correct square into a mismatched one.
+        art_label.setPixmap(pixmap)
+        layout.addWidget(art_label)
+
+        text_col = QVBoxLayout()
+        text_col.setSpacing(1)
+        title_label = ElidingLabel(title, self)
+        title_label.setObjectName("QueueRowTitle")
+        artist_label = ElidingLabel(artist, self)
+        artist_label.setObjectName("QueueRowArtist")
+        text_col.addWidget(title_label)
+        text_col.addWidget(artist_label)
+        layout.addLayout(text_col, stretch=1)
+
+    def _get_pulse(self) -> float:
+        return self._pulse
+
+    def _set_pulse(self, value: float):
+        self._pulse = value
+        self.update()
+
+    pulseValue = pyqtProperty(float, fget=_get_pulse, fset=_set_pulse)
+
+    def play_click_pulse(self):
+        # Called explicitly by the double-click handlers in the main
+        # class (_handle_queue_item_double_clicked etc.), not from a
+        # mousePressEvent override here - this widget deliberately leaves
+        # mouse press/release events untouched so they keep propagating
+        # up to queue_list_widget's own itemDoubleClicked/
+        # customContextMenuRequested signals exactly as before. Hooking
+        # the pulse in from outside gets the same visual feedback without
+        # any risk of that passthrough breaking.
+        self._pulse_anim.stop()
+        self._pulse = 1.0
+        self._pulse_anim.start()
+
+    def enterEvent(self, event):
+        self._hovered = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hovered = False
+        self.update()
+        super().leaveEvent(event)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self._hovered or self._pulse > 0.0:
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setPen(Qt.PenStyle.NoPen)
+            if self._hovered:
+                painter.setBrush(QColor(255, 255, 255, 16))
+                painter.drawRoundedRect(self.rect(), 8, 8)
+            if self._pulse > 0.0:
+                painter.setBrush(QColor(255, 255, 255, int(55 * self._pulse)))
+                painter.drawRoundedRect(self.rect(), 8, 8)
+            painter.end()
+
+
 class TopSongsHighlightOverlay(QWidget):
     # A sliding highlight pill for the Top Songs list, mirroring
     # NowPlayingListWidget's animated sweep above - same rgba(255,255,255,
@@ -2739,18 +2871,73 @@ class AdaptiveMusicPlayer(QMainWindow):
     mprisArtReady = pyqtSignal()  # fires whenever a background art write finishes
     mprisServiceReady = pyqtSignal()
 
-    # view_stack page indices. Home/Library/Artists are real peer tabs -
-    # switching between them updates active_top_level_tab (see
-    # switch_top_level_tab). Showcase/Lyrics are detail views you drop
-    # into and back out of, not tabs - "back" (close_current_view)
-    # returns to whichever of the three tabs you were actually on, not
-    # unconditionally to one fixed page.
+    # view_stack page indices. Home/Library/Artists/Playlists are real
+    # peer tabs - switching between them updates active_top_level_tab
+    # (see switch_top_level_tab). Showcase/Lyrics/Queue are detail views
+    # you drop into and back out of, not tabs - "back"
+    # (close_current_view) returns to whichever of the four tabs you
+    # were actually on, not unconditionally to one fixed page.
     TAB_HOME = 0
     TAB_LIBRARY = 1
     TAB_ARTISTS = 2
-    VIEW_SHOWCASE = 3
-    VIEW_LYRICS = 4
-    TAB_NAMES = {TAB_HOME: "Home", TAB_LIBRARY: "Library", TAB_ARTISTS: "Artists"}
+    TAB_PLAYLISTS = 3
+    VIEW_SHOWCASE = 4
+    VIEW_LYRICS = 5
+    VIEW_QUEUE = 6
+    TAB_NAMES = {TAB_HOME: "Home", TAB_LIBRARY: "Library", TAB_ARTISTS: "Artists", TAB_PLAYLISTS: "Playlists"}
+
+    # Prefix for a user-created playlist's synthetic "album" key, mirroring
+    # "__mix__..." (see REPLAY_MIX_KEY etc. below) - a playlist is stored
+    # and played back through the exact same _set_mix()/album_tracks/
+    # album_display_meta machinery the smart mixes use, just persisted to
+    # disk (see self.user_playlists) instead of being regenerated from
+    # listening history on every refresh. Kept as its own distinct prefix
+    # (not "__mix__...") so playlists can be told apart from smart mixes
+    # anywhere that matters - e.g. show_album_card_context_menu offering
+    # Rename/Delete only for playlists, never for a generated mix.
+    PLAYLIST_KEY_PREFIX = "__playlist__"
+
+    # Sentinel active_playing_album_key while a manually-queued track (one
+    # added via "Play Next"/"Add to Queue", not part of whatever album/mix/
+    # playlist is currently being browsed) is what's actually playing - see
+    # _play_next_from_queue().
+    QUEUE_KEY = "__queue__"
+
+    # How the Playlists grid can be ordered - see _ordered_playlists() and
+    # the sort button built in _build_playlists_view(). Persisted (see
+    # "playlist_sort_mode" in __init__) so the choice sticks across
+    # launches instead of always resetting to alphabetical.
+    PLAYLIST_SORT_MODES = ("alphabetical", "most_listened", "newest", "oldest")
+    PLAYLIST_SORT_LABELS = {
+        "alphabetical": "Alphabetical",
+        "most_listened": "Most Listened",
+        "newest": "Newest",
+        "oldest": "Oldest",
+    }
+
+    # (gradient-top-left, gradient-bottom-right) options a playlist's cover
+    # can be assigned from - see _playlist_cover_colors(). Deliberately a
+    # separate palette from MIX_STYLES below rather than reusing it: the
+    # smart mixes each have one fixed, meaningful color (Night Owl is
+    # always midnight blue, Morning Mix is always sunrise orange, ...),
+    # while playlists just need *variety* from one to the next so a
+    # Playlists grid with several of them doesn't read as a wall of
+    # identical tiles. Modeled on Morning Mix's own look specifically -
+    # both stops stay bright/light/saturated rather than sinking toward
+    # near-black the way the smart-mix palette above often does, so every
+    # playlist reads as poppy and sunny, just in a different hue.
+    PLAYLIST_COVER_PALETTE = [
+        (QColor(255, 170, 66), QColor(255, 92, 74)),   # sunrise orange - Morning Mix's own pairing
+        (QColor(255, 214, 90), QColor(255, 140, 66)),  # golden yellow
+        (QColor(255, 130, 168), QColor(255, 84, 120)), # bubblegum pink
+        (QColor(190, 130, 255), QColor(140, 90, 240)), # bright violet
+        (QColor(110, 180, 255), QColor(70, 120, 255)), # sky blue
+        (QColor(90, 220, 200), QColor(50, 190, 170)),  # mint teal
+        (QColor(160, 224, 90), QColor(110, 195, 70)),  # lime green
+        (QColor(255, 120, 100), QColor(240, 70, 90)),  # coral red
+        (QColor(150, 140, 255), QColor(100, 90, 235)), # periwinkle
+        (QColor(255, 150, 210), QColor(230, 90, 170)), # hot pink
+    ]
 
     def __init__(self):
         super().__init__()
@@ -2803,6 +2990,28 @@ class AdaptiveMusicPlayer(QMainWindow):
                 self.pinned_album_keys = []
         except Exception:
             self.pinned_album_keys = []
+
+        # User-created playlists: playlist_id -> {"name", "track_paths",
+        # "created_ts", and optionally "cover_bytes" (a user-picked PNG/JPEG,
+        # base64-encoded - see set_playlist_cover_image()). This dict is the
+        # actual source of truth (saved back out via _save_user_playlists()
+        # after every create/rename/delete/track/cover edit); the
+        # "__playlist__<id>" entries mirrored into album_tracks/
+        # album_display_meta by _sync_user_playlists_into_library() are just
+        # a derived view for the existing album-shaped playback/display code
+        # to read, and get rebuilt from this dict, not the other way around.
+        try:
+            self.user_playlists: dict = json.loads(self.settings.value("user_playlists", "{}") or "{}")
+            if not isinstance(self.user_playlists, dict):
+                self.user_playlists = {}
+        except Exception:
+            self.user_playlists = {}
+
+        # How the Playlists grid is currently ordered - see
+        # PLAYLIST_SORT_MODES/_ordered_playlists().
+        self.playlist_sort_mode = self.settings.value("playlist_sort_mode", "alphabetical")
+        if self.playlist_sort_mode not in self.PLAYLIST_SORT_MODES:
+            self.playlist_sort_mode = "alphabetical"
 
         # Resume-last-session state - see _save_resume_state() (writes it)
         # and _try_resume_last_session() (reads it back on launch).
@@ -2881,6 +3090,21 @@ class AdaptiveMusicPlayer(QMainWindow):
         
         self.active_playing_tracks: list[str] = []
         self.active_playing_album_key: Optional[str] = None
+        # Manual play queue - track paths waiting to play next, independent
+        # of whatever album/mix/playlist is currently being browsed or
+        # playing. Session-only (not persisted across launches), same as
+        # "what plays next" always has been for the regular album-order
+        # case. See play_next()/_play_next_from_queue() for how this gets
+        # drained, and _add_queue_and_playlist_actions() for how things get
+        # added to it.
+        self.play_queue: list[str] = []
+        # Snapshot of (active_playing_tracks, active_playing_album_key,
+        # current_track_index) taken the moment playback first dips into
+        # the queue - so once the queue drains, play_next() can hand
+        # playback back to exactly wherever regular context left off,
+        # instead of just stopping. None whenever nothing's been diverted
+        # into the queue (i.e. most of the time).
+        self._queue_return_context: Optional[tuple] = None
         # Cache for the "now playing" outline - which cards currently have
         # it (self._now_playing_card_widgets) and which album key that
         # cache reflects (self._now_playing_outline_key), so
@@ -3029,15 +3253,19 @@ class AdaptiveMusicPlayer(QMainWindow):
 
         home_page = self._build_home_view()
         artists_page = self._build_artists_view()
+        playlists_page = self._build_playlists_view()
         self.showcase_page = self._build_showcase_view()
         self.lyrics_page = self._build_lyrics_view()
+        self.queue_page = self._build_queue_view()
 
         self.view_stack = FadingStackedWidget()
         self.view_stack.addWidget(home_page)       # TAB_HOME = 0
         self.view_stack.addWidget(library_page)    # TAB_LIBRARY = 1
         self.view_stack.addWidget(artists_page)    # TAB_ARTISTS = 2
-        self.view_stack.addWidget(self.showcase_page)  # VIEW_SHOWCASE = 3
-        self.view_stack.addWidget(self.lyrics_page)    # VIEW_LYRICS = 4
+        self.view_stack.addWidget(playlists_page)  # TAB_PLAYLISTS = 3
+        self.view_stack.addWidget(self.showcase_page)  # VIEW_SHOWCASE = 4
+        self.view_stack.addWidget(self.lyrics_page)    # VIEW_LYRICS = 5
+        self.view_stack.addWidget(self.queue_page)     # VIEW_QUEUE = 6
         # The base class's setCurrentIndex, deliberately - this is the
         # startup default, not a real navigation event, so it shouldn't
         # crossfade through the Home placeholder on every single launch
@@ -3057,6 +3285,7 @@ class AdaptiveMusicPlayer(QMainWindow):
         QShortcut(QKeySequence(Qt.Key.Key_Tab), self, activated=self.toggle_showcase_view)
         
         self.apply_theme(QColor(18, 20, 24))
+        self._refresh_queue_panel()
 
     def _load_bundled_icon_pixmap(self) -> Optional[QPixmap]:
         # When installed via the Arch package, a proper hand-designed icon
@@ -3266,7 +3495,7 @@ class AdaptiveMusicPlayer(QMainWindow):
         layout.setSpacing(8)
 
         self.tab_buttons = {}
-        for index in (self.TAB_HOME, self.TAB_LIBRARY, self.TAB_ARTISTS):
+        for index in (self.TAB_HOME, self.TAB_LIBRARY, self.TAB_ARTISTS, self.TAB_PLAYLISTS):
             btn = QPushButton(self.TAB_NAMES[index], bar)
             btn.setObjectName("NavTabButton")
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -3276,6 +3505,17 @@ class AdaptiveMusicPlayer(QMainWindow):
             layout.addWidget(btn)
             self.tab_buttons[index] = btn
 
+        # Two upcoming, not-yet-built features get a preview slot right
+        # next to Playlists rather than waiting to appear until they're
+        # actually shipped - LRC Grab (lyric-file fetching) and Picard
+        # (a simplified MusicBrainz Picard-style tagger). Neither is a
+        # real tab: they don't belong in tab_buttons/switch_top_level_tab
+        # at all, just a dimmed pill that explains itself on click/hover
+        # instead of silently doing nothing.
+        layout.addSpacing(10)
+        for label in ("LRC Grab", "Picard"):
+            layout.addWidget(self._build_soon_nav_item(bar, label))
+
         layout.addStretch(1)
 
         self._nav_tab_bar_effect = QGraphicsOpacityEffect(bar)
@@ -3283,6 +3523,36 @@ class AdaptiveMusicPlayer(QMainWindow):
         bar.setGraphicsEffect(self._nav_tab_bar_effect)
 
         return bar
+
+    def _build_soon_nav_item(self, bar: QWidget, label_text: str) -> QWidget:
+        # A real QPushButton (so it still gets hover feedback and a click
+        # response) paired with a small "SOON" pill, visually distinct
+        # from the actual peer tabs next to it - same idea as the pin-star
+        # badge on an AlbumCardWidget (a separate child QLabel layered
+        # alongside, not baked into the button's own text/style).
+        container = QWidget(bar)
+        row = QHBoxLayout(container)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(5)
+
+        btn = QPushButton(label_text, container)
+        btn.setObjectName("NavTabButtonSoon")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        btn.setToolTip(f"{label_text} \u2014 coming soon")
+        btn.clicked.connect(lambda checked=False, name=label_text: self._show_coming_soon(name))
+        row.addWidget(btn)
+
+        soon_badge = QLabel("SOON", container)
+        soon_badge.setObjectName("SoonBadge")
+        soon_badge.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        row.addWidget(soon_badge, alignment=Qt.AlignmentFlag.AlignVCenter)
+
+        return container
+
+    def _show_coming_soon(self, feature_name: str):
+        self.status_label.setText(f"{feature_name} is coming soon \u2014 working on it next!")
+        self.status_label.setVisible(True)
 
     def _set_nav_tab_bar_visible(self, visible: bool):
         # Opacity, not setVisible() - setVisible removes the bar from
@@ -3303,6 +3573,8 @@ class AdaptiveMusicPlayer(QMainWindow):
         self._refresh_nav_tab_buttons()
         if index == self.TAB_HOME:
             self.refresh_home_shelves()
+        elif index == self.TAB_PLAYLISTS:
+            self.rebuild_playlist_grid()
         # Artist view isn't refreshed here on every switch, unlike Home
         # above - grouping only changes when the library itself changes
         # (a scan/rescan), which already calls refresh_artist_grid()
@@ -3560,6 +3832,276 @@ class AdaptiveMusicPlayer(QMainWindow):
             "is_mix": True,
             "mix_style": style,
         }
+
+    # --------------------------------------------------- User playlists --
+    # Real, user-created "make my own playlist, add whatever I want, name
+    # it, save it" playlists - built on top of the exact same __mix__-style
+    # machinery above (_set_mix's sibling, _sync_user_playlists_into_library,
+    # is what actually mirrors these into album_tracks/album_display_meta),
+    # just with self.user_playlists as the persisted source of truth
+    # instead of listening history. See PLAYLIST_KEY_PREFIX up in the class
+    # constants for how a playlist's synthetic key is told apart from a
+    # smart mix's.
+    def _playlist_key(self, playlist_id: str) -> str:
+        return f"{self.PLAYLIST_KEY_PREFIX}{playlist_id}"
+
+    def _save_user_playlists(self):
+        self.settings.setValue("user_playlists", json.dumps(self.user_playlists))
+
+    def _sync_user_playlists_into_library(self):
+        # Mirrors every saved playlist into album_tracks/album_display_meta
+        # under its own "__playlist__<id>" key - the same shape _set_mix()
+        # gives the smart mixes, which is what lets play_track_at, the
+        # track panel, scrobbling, and everything else treat an opened
+        # playlist exactly like a real album with zero special-casing.
+        # Deliberately not just calling _set_mix() itself for this though -
+        # that helper drops the key entirely for an empty track list (fine
+        # for a smart mix, which just has nothing to show that way), but a
+        # playlist someone just created with 0 tracks still needs its own
+        # card to click into and start adding things to.
+        #
+        # Called after on_scan_complete() (which wipes album_tracks/
+        # album_display_meta back down to just the real, freshly-scanned
+        # albums) and after any playlist create/rename/delete/track edit,
+        # so this mirror never drifts from self.user_playlists (the actual
+        # saved source of truth).
+        stale_keys = [
+            key for key in self.album_tracks
+            if key.startswith(self.PLAYLIST_KEY_PREFIX)
+            and key[len(self.PLAYLIST_KEY_PREFIX):] not in self.user_playlists
+        ]
+        for key in stale_keys:
+            self.album_tracks.pop(key, None)
+            self.album_display_meta.pop(key, None)
+
+        for playlist_id, record in self.user_playlists.items():
+            key = self._playlist_key(playlist_id)
+            track_paths = record.get("track_paths", [])
+            count = len(track_paths)
+            subtitle = "No tracks yet" if count == 0 else f"{count} track{'s' if count != 1 else ''}"
+            self.album_tracks[key] = list(track_paths)
+            self.album_display_meta[key] = {
+                "title": record.get("name", "Untitled Playlist"),
+                "artist": subtitle,
+                "icon": QIcon(),
+                "pixmap": self._playlist_cover_pixmap(playlist_id, record),
+                "cover_bytes": None,
+                "added_ts": record.get("created_ts", 0),
+                "is_mix": True,
+                "mix_style": "playlist",
+            }
+
+    def _playlist_cover_colors(self, playlist_id: str) -> tuple:
+        # A stable pick from PLAYLIST_COVER_PALETTE, so each playlist gets
+        # its own consistent gradient across refreshes/restarts instead of
+        # every playlist sharing MIX_STYLES' one fixed "playlist" look.
+        # Hashed via hashlib rather than Python's own hash() - str hash()
+        # is randomized per-process (PYTHONHASHSEED) specifically so it
+        # *isn't* stable across runs, which would otherwise reshuffle
+        # every playlist's color on every single launch.
+        digest = hashlib.md5(playlist_id.encode("utf-8")).hexdigest()
+        index = int(digest[:8], 16) % len(self.PLAYLIST_COVER_PALETTE)
+        return self.PLAYLIST_COVER_PALETTE[index]
+
+    def _playlist_cover_pixmap(self, playlist_id: str, record: dict) -> QPixmap:
+        # A user-picked custom image (see set_playlist_cover_image()) wins
+        # if one's been set; otherwise falls back to a generated gradient
+        # tile in this playlist's own stable palette color.
+        cover_b64 = record.get("cover_bytes")
+        if cover_b64:
+            try:
+                return self.cover_bytes_to_pixmap(base64.b64decode(cover_b64))
+            except (ValueError, binascii.Error):
+                pass  # corrupt/truncated data somehow - fall through to the generated cover
+        return self.generate_mix_cover_pixmap(
+            style="playlist", override_colors=self._playlist_cover_colors(playlist_id)
+        )
+
+    def create_playlist(self, name: str, initial_track_paths: Optional[list] = None) -> str:
+        name = name.strip() or "New Playlist"
+        playlist_id = uuid.uuid4().hex[:12]
+        self.user_playlists[playlist_id] = {
+            "name": name,
+            "track_paths": list(initial_track_paths) if initial_track_paths else [],
+            "created_ts": int(time.time()),
+        }
+        self._save_user_playlists()
+        self._sync_user_playlists_into_library()
+        self.rebuild_playlist_grid()
+        return playlist_id
+
+    def prompt_new_playlist(self, initial_track_paths: Optional[list] = None):
+        name, ok = QInputDialog.getText(self, "New Playlist", "Playlist name:")
+        if not ok:
+            return
+        name = name.strip()
+        if not name:
+            return
+        self.create_playlist(name, initial_track_paths)
+        count = len(initial_track_paths) if initial_track_paths else 0
+        suffix = f" with {count} track{'s' if count != 1 else ''}" if count else ""
+        self.status_label.setText(f"Created \u201c{name}\u201d{suffix}")
+        self.status_label.setVisible(True)
+
+    def prompt_rename_playlist(self, playlist_id: str):
+        record = self.user_playlists.get(playlist_id)
+        if not record:
+            return
+        name, ok = QInputDialog.getText(self, "Rename Playlist", "Playlist name:", QLineEdit.EchoMode.Normal, record["name"])
+        if not ok:
+            return
+        name = name.strip()
+        if not name:
+            return
+        self.rename_playlist(playlist_id, name)
+
+    def rename_playlist(self, playlist_id: str, new_name: str):
+        record = self.user_playlists.get(playlist_id)
+        if not record:
+            return
+        new_name = new_name.strip()
+        if not new_name:
+            return
+        record["name"] = new_name
+        self._save_user_playlists()
+        self._sync_user_playlists_into_library()
+        self.rebuild_playlist_grid()
+        # If this playlist happens to be open in the track panel right
+        # now, its heading still shows the old name until refreshed.
+        if self.browsing_album_key == self._playlist_key(playlist_id):
+            self.display_album_tracks_by_key(self.browsing_album_key)
+
+    def prompt_delete_playlist(self, playlist_id: str):
+        record = self.user_playlists.get(playlist_id)
+        if not record:
+            return
+        reply = QMessageBox.question(
+            self, "Delete Playlist",
+            f"Delete \u201c{record['name']}\u201d? This can't be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.delete_playlist(playlist_id)
+
+    def delete_playlist(self, playlist_id: str):
+        if playlist_id not in self.user_playlists:
+            return
+        key = self._playlist_key(playlist_id)
+        was_browsing = self.browsing_album_key == key
+        was_playing = self.active_playing_album_key == key
+        del self.user_playlists[playlist_id]
+        self._save_user_playlists()
+        self.album_tracks.pop(key, None)
+        self.album_display_meta.pop(key, None)
+        self.rebuild_playlist_grid()
+        if was_browsing:
+            self.browsing_album_key = None
+            self.browsing_tracks = []
+            self.song_list_widget.clear()
+            self.album_heading.setText("Select an album")
+        if was_playing:
+            # The deleted playlist's own tracks can't keep playing under a
+            # key that no longer exists anywhere - stop cleanly rather
+            # than leaving active_playing_album_key pointing at nothing.
+            self.player.stop()
+            self.active_playing_tracks = []
+            self.active_playing_album_key = None
+            self.current_track_index = -1
+            self.play_btn.set_playing(False)
+            self.is_playing = False
+            self._refresh_now_playing_outlines(force=True)
+
+    def add_tracks_to_playlist(self, playlist_id: str, track_paths: list):
+        record = self.user_playlists.get(playlist_id)
+        if not record:
+            return
+        existing = set(record["track_paths"])
+        added = 0
+        for path in track_paths:
+            if path not in existing:
+                record["track_paths"].append(path)
+                existing.add(path)
+                added += 1
+        self._save_user_playlists()
+        self._sync_user_playlists_into_library()
+        self.rebuild_playlist_grid()
+        if self.browsing_album_key == self._playlist_key(playlist_id):
+            self.display_album_tracks_by_key(self.browsing_album_key)
+        if added:
+            noun = "track" if added == 1 else "tracks"
+            self.status_label.setText(f"Added {added} {noun} to \u201c{record['name']}\u201d")
+        else:
+            self.status_label.setText(f"Already in \u201c{record['name']}\u201d")
+        self.status_label.setVisible(True)
+
+    def remove_track_from_playlist_at(self, playlist_id: str, row: int):
+        record = self.user_playlists.get(playlist_id)
+        if not record or not (0 <= row < len(record["track_paths"])):
+            return
+        del record["track_paths"][row]
+        self._save_user_playlists()
+        self._sync_user_playlists_into_library()
+        self.rebuild_playlist_grid()
+        if self.browsing_album_key == self._playlist_key(playlist_id):
+            self.display_album_tracks_by_key(self.browsing_album_key)
+
+    # Custom cover images are re-encoded down to this max dimension before
+    # being stored (see set_playlist_cover_image) - a phone photo can
+    # easily be 4000px+ per side and several MB, and the cover is only
+    # ever displayed at COVER_SIZE (125px) or so; storing it at full
+    # resolution would just bloat settings for no visible benefit.
+    _PLAYLIST_COVER_MAX_DIMENSION = 500
+
+    def set_playlist_cover_image(self, playlist_id: str):
+        record = self.user_playlists.get(playlist_id)
+        if not record:
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose Playlist Cover", "", "Images (*.png *.jpg *.jpeg)"
+        )
+        if not path:
+            return
+
+        source = QPixmap(path)
+        if source.isNull():
+            self.status_label.setText("That file doesn't look like a valid PNG or JPEG.")
+            self.status_label.setVisible(True)
+            return
+
+        # Downscale before storing (see _PLAYLIST_COVER_MAX_DIMENSION),
+        # but never upscale a smaller source image.
+        if source.width() > self._PLAYLIST_COVER_MAX_DIMENSION or source.height() > self._PLAYLIST_COVER_MAX_DIMENSION:
+            source = source.scaled(
+                self._PLAYLIST_COVER_MAX_DIMENSION, self._PLAYLIST_COVER_MAX_DIMENSION,
+                Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation,
+            )
+
+        buffer = QBuffer()
+        buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+        source.save(buffer, "JPEG", 88)
+        image_bytes = bytes(buffer.data())
+        buffer.close()
+
+        record["cover_bytes"] = base64.b64encode(image_bytes).decode("ascii")
+        self._save_user_playlists()
+        self._sync_user_playlists_into_library()
+        self.rebuild_playlist_grid()
+        if self.browsing_album_key == self._playlist_key(playlist_id):
+            self.display_album_tracks_by_key(self.browsing_album_key)
+        self.status_label.setText(f"Updated cover for \u201c{record['name']}\u201d")
+        self.status_label.setVisible(True)
+
+    def clear_playlist_cover_image(self, playlist_id: str):
+        record = self.user_playlists.get(playlist_id)
+        if not record or not record.get("cover_bytes"):
+            return
+        del record["cover_bytes"]
+        self._save_user_playlists()
+        self._sync_user_playlists_into_library()
+        self.rebuild_playlist_grid()
+        if self.browsing_album_key == self._playlist_key(playlist_id):
+            self.display_album_tracks_by_key(self.browsing_album_key)
 
     def refresh_replay_mix(self):
         # Deliberately track-level, not album-level - two favorite tracks
@@ -3905,6 +4447,243 @@ class AdaptiveMusicPlayer(QMainWindow):
         layout.addWidget(scroll_area)
 
         return page
+
+    # ------------------------------------------------------ Playlists tab --
+    def _build_playlists_view(self) -> QWidget:
+        page = QWidget()
+        page.setObjectName("PlaylistsPage")
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(10)
+
+        header_row = QHBoxLayout()
+        heading = QLabel("Playlists", page)
+        heading.setObjectName("ArtistsHeading")
+        header_row.addWidget(heading)
+        header_row.addStretch(1)
+
+        # Opens show_playlist_sort_menu() - a checkable QActionGroup menu
+        # of PLAYLIST_SORT_MODES. Label text is kept in sync with the
+        # current mode by _update_playlist_sort_button_text().
+        self.playlist_sort_btn = QPushButton("", page)
+        self.playlist_sort_btn.setObjectName("PlaylistSortButton")
+        self.playlist_sort_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.playlist_sort_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.playlist_sort_btn.clicked.connect(self.show_playlist_sort_menu)
+        header_row.addWidget(self.playlist_sort_btn, alignment=Qt.AlignmentFlag.AlignVCenter)
+        self._update_playlist_sort_button_text()
+
+        self.new_playlist_btn = QPushButton("+  New Playlist", page)
+        self.new_playlist_btn.setObjectName("NewPlaylistButton")
+        self.new_playlist_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.new_playlist_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.new_playlist_btn.clicked.connect(lambda: self.prompt_new_playlist(None))
+        header_row.addWidget(self.new_playlist_btn, alignment=Qt.AlignmentFlag.AlignVCenter)
+        layout.addLayout(header_row)
+
+        # Shown instead of the grid while there are no saved playlists yet
+        # (matches artists_empty_label's role on the Artists page) - the
+        # grid itself is always built (see rebuild_playlist_grid), just
+        # empty.
+        self.playlists_empty_label = QLabel(
+            "You haven't made any playlists yet. Click \u201c+ New Playlist\u201d to start one, "
+            "or right-click any song or album and choose \u201cAdd to Playlist\u201d.", page
+        )
+        self.playlists_empty_label.setObjectName("ArtistsEmptyLabel")
+        self.playlists_empty_label.setStyleSheet("font-size: 13px; color: rgba(255,255,255,0.5);")
+        self.playlists_empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.playlists_empty_label.setWordWrap(True)
+        self.playlists_empty_label.setVisible(False)
+        layout.addWidget(self.playlists_empty_label)
+
+        # Same AlbumCardWidget/grid component Library and Artists use -
+        # "mode" is set to "playlist" per-card in rebuild_playlist_grid()
+        # and wired directly to play_playlist()/show_playlist_card_context_menu()
+        # below, the same way Artist tiles bypass the generic
+        # handle_card_clicked() machinery (a playlist tile's click
+        # behavior - double-click to play in place, right-click for
+        # everything else - doesn't fit the single-click-to-browse/
+        # double-click-to-play semantics that machinery is shared for
+        # real album/track cards).
+        self.playlist_grid = AutoHeightIconGrid(self)
+        self.playlist_grid.setObjectName("AlbumGrid")  # same visual language as the album grid
+        self.playlist_grid.setViewMode(QListWidget.ViewMode.IconMode)
+        self.playlist_grid.setGridSize(GRID_SIZE)
+        self.playlist_grid.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.playlist_grid.setMovement(QListWidget.Movement.Static)
+        self.playlist_grid.setSpacing(12)
+        self.playlist_grid.setWordWrap(False)
+        self.playlist_grid.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.playlist_grid.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.playlist_grid.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.playlist_grid.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+        scroll_content = CenteredGridColumnWidget(cell_width=GRID_SIZE.width(), spacing=12)
+        scroll_layout = QVBoxLayout(scroll_content)
+        scroll_layout.setContentsMargins(0, 0, 0, 0)
+        scroll_layout.addWidget(self.playlist_grid)
+        scroll_layout.addStretch(1)
+
+        scroll_area = ControlledScrollArea(self)
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll_area.setWidget(scroll_content)
+        layout.addWidget(scroll_area)
+
+        return page
+
+    def _ordered_playlists(self) -> list:
+        # (playlist_id, record) pairs in whatever order self.playlist_sort_mode
+        # currently calls for - see PLAYLIST_SORT_MODES/set_playlist_sort_mode().
+        items = list(self.user_playlists.items())
+        mode = self.playlist_sort_mode
+
+        if mode == "most_listened":
+            # Sum of all-time play counts across every track the playlist
+            # currently contains - not tracked per-playlist anywhere, just
+            # derived fresh from the same play-history counts Most Played
+            # already uses. created_ts as a tiebreaker (newer first) so a
+            # tie between two never-played playlists doesn't fall back to
+            # dict insertion order.
+            counts = self.get_track_play_counts()
+            def listen_score(record):
+                return sum(counts.get(p, 0) for p in record.get("track_paths", []))
+            items.sort(key=lambda kv: (listen_score(kv[1]), kv[1].get("created_ts", 0)), reverse=True)
+        elif mode == "newest":
+            items.sort(key=lambda kv: kv[1].get("created_ts", 0), reverse=True)
+        elif mode == "oldest":
+            items.sort(key=lambda kv: kv[1].get("created_ts", 0))
+        else:  # "alphabetical", and the fallback for any unrecognized value
+            items.sort(key=lambda kv: kv[1]["name"].lower())
+
+        return items
+
+    def set_playlist_sort_mode(self, mode: str):
+        if mode not in self.PLAYLIST_SORT_MODES or mode == self.playlist_sort_mode:
+            return
+        self.playlist_sort_mode = mode
+        self.settings.setValue("playlist_sort_mode", mode)
+        self._update_playlist_sort_button_text()
+        self.rebuild_playlist_grid()
+
+    def _update_playlist_sort_button_text(self):
+        if hasattr(self, "playlist_sort_btn"):
+            self.playlist_sort_btn.setText(f"\u2195  {self.PLAYLIST_SORT_LABELS[self.playlist_sort_mode]}")
+
+    def show_playlist_sort_menu(self):
+        menu = QMenu(self)
+        group = QActionGroup(self)
+        group.setExclusive(True)
+        for mode in self.PLAYLIST_SORT_MODES:
+            action = QAction(self.PLAYLIST_SORT_LABELS[mode], self, checkable=True)
+            action.setChecked(mode == self.playlist_sort_mode)
+            action.triggered.connect(lambda checked=False, m=mode: self.set_playlist_sort_mode(m))
+            group.addAction(action)
+            menu.addAction(action)
+        menu.exec(self.playlist_sort_btn.mapToGlobal(QPoint(0, self.playlist_sort_btn.height())))
+
+    def rebuild_playlist_grid(self):
+        if not hasattr(self, "playlist_grid"):
+            return  # UI not built yet - called too early during init
+        self._sync_user_playlists_into_library()
+        self.playlist_grid.clear()
+        ordered = self._ordered_playlists()
+        self.playlists_empty_label.setVisible(not ordered)
+        for playlist_id, record in ordered:
+            key = self._playlist_key(playlist_id)
+            meta = self.album_display_meta.get(key)
+            if not meta:
+                continue
+
+            item = QListWidgetItem()
+            item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            item.setSizeHint(CARD_SIZE)
+            self.playlist_grid.addItem(item)
+
+            card = AlbumCardWidget(meta["pixmap"], meta["title"], meta["artist"], card_size=CARD_SIZE, is_mix=True)
+            card.mode = "playlist"
+            card.album_key = key
+            # Deliberately no card.clicked wiring - a single click on a
+            # playlist tile does nothing (beyond AlbumCardWidget's own
+            # built-in press-pulse feedback) rather than navigating
+            # anywhere. Double-click plays it in place (see
+            # play_playlist()); browsing/editing its tracks is a right-
+            # click ("View Tracks") away instead of being one accidental
+            # single click from yanking you over to the Library page.
+            card.doubleClicked.connect(lambda k=key: self.play_playlist(k))
+            card.rightClicked.connect(lambda c=card: self.show_playlist_card_context_menu(c))
+            self.playlist_grid.setItemWidget(item, card)
+
+            if key == self.active_playing_album_key:
+                card.set_accent(self._current_accent)
+                card.set_now_playing(True)
+
+        self.playlist_grid.update_height()
+
+    def handle_playlist_card_clicked(self, key: str):
+        # Single click - opens the playlist's track list on the Library
+        # page for browsing/editing, exactly the same "jump straight into
+        # it" behavior clicking an artist tile has, just landing on a
+        # track list instead of a filtered album grid. Doesn't start
+        # playback - see play_playlist() for that.
+        self.display_album_tracks_by_key(key)
+        self.switch_top_level_tab(self.TAB_LIBRARY)
+
+    def play_playlist(self, key: str):
+        # Double-click, or "Play" from the context menu - starts the
+        # playlist playing right where you are, without navigating
+        # anywhere. Deliberately doesn't touch browsing_album_key/
+        # browsing_tracks (what the Library page's track panel is
+        # currently showing) or switch_top_level_tab the way
+        # handle_playlist_card_clicked()/_start_playing_browsed_album()
+        # do - playing something from its card on the Playlists page
+        # shouldn't yank you over to the Library page just to do it.
+        track_paths = self.album_tracks.get(key, [])
+        if not track_paths:
+            return
+        self.active_playing_tracks = list(track_paths)
+        self.active_playing_album_key = key
+        self._refresh_now_playing_outlines()
+        self.play_track_at(0)
+
+    def show_playlist_card_context_menu(self, card: AlbumCardWidget):
+        if card.mode != "playlist" or not card.album_key:
+            return
+        playlist_id = card.album_key[len(self.PLAYLIST_KEY_PREFIX):]
+        if playlist_id not in self.user_playlists:
+            return
+
+        menu = QMenu(self)
+        play_action = QAction("Play", self)
+        play_action.triggered.connect(lambda checked=False, k=card.album_key: self.play_playlist(k))
+        menu.addAction(play_action)
+
+        view_action = QAction("View Tracks", self)
+        view_action.triggered.connect(lambda checked=False, k=card.album_key: self.handle_playlist_card_clicked(k))
+        menu.addAction(view_action)
+
+        track_paths = self.album_tracks.get(card.album_key, [])
+        menu.addSeparator()
+        self._add_queue_and_playlist_actions(menu, track_paths)
+
+        menu.addSeparator()
+        rename_action = QAction("Rename...", self)
+        rename_action.triggered.connect(lambda checked=False, pid=playlist_id: self.prompt_rename_playlist(pid))
+        menu.addAction(rename_action)
+        cover_action = QAction("Set Cover Image...", self)
+        cover_action.triggered.connect(lambda checked=False, pid=playlist_id: self.set_playlist_cover_image(pid))
+        menu.addAction(cover_action)
+        if self.user_playlists[playlist_id].get("cover_bytes"):
+            remove_cover_action = QAction("Remove Cover Image", self)
+            remove_cover_action.triggered.connect(lambda checked=False, pid=playlist_id: self.clear_playlist_cover_image(pid))
+            menu.addAction(remove_cover_action)
+        delete_action = QAction("Delete", self)
+        delete_action.triggered.connect(lambda checked=False, pid=playlist_id: self.prompt_delete_playlist(pid))
+        menu.addAction(delete_action)
+
+        menu.exec(QCursor.pos())
 
     def _artist_groups(self) -> list:
         # [{"name": display name, "album_keys": [...]}], alphabetical by
@@ -4658,6 +5437,8 @@ class AdaptiveMusicPlayer(QMainWindow):
         self.song_list_widget.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.song_list_widget.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.song_list_widget.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.song_list_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.song_list_widget.customContextMenuRequested.connect(self._show_song_list_context_menu)
         # Pinned to a known pixel size (keeping whatever font family was
         # already inherited) so the now-playing grow/shrink animation has
         # a fixed, known baseline to animate from instead of guessing at
@@ -4792,6 +5573,167 @@ class AdaptiveMusicPlayer(QMainWindow):
         self.lyrics_box.set_top_overhead(self.lyrics_back_btn.sizeHint().height() + layout.spacing())
         return page
 
+    # -------------------------------------------------------- Queue view --
+    def _build_queue_view(self) -> QWidget:
+        page = QWidget()
+        page.setObjectName("QueuePage")
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(30, 0, 30, 20)
+        layout.setSpacing(12)
+
+        top_row = QHBoxLayout()
+        self.queue_back_btn = QPushButton("\u2190  Library", page)
+        self.queue_back_btn.setObjectName("ShowcaseBackButton")
+        self.queue_back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.queue_back_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.queue_back_btn.clicked.connect(self.close_current_view)
+        top_row.addWidget(self.queue_back_btn)
+        top_row.addStretch(1)
+
+        self.queue_clear_btn = QPushButton("Clear Queue", page)
+        self.queue_clear_btn.setObjectName("ArtistFilterClearButton")
+        self.queue_clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.queue_clear_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.queue_clear_btn.clicked.connect(self.clear_queue)
+        top_row.addWidget(self.queue_clear_btn)
+        layout.addLayout(top_row)
+
+        self.queue_heading = QLabel("Queue", page)
+        self.queue_heading.setObjectName("ArtistsHeading")
+        layout.addWidget(self.queue_heading)
+
+        # --- Now Playing card ---------------------------------------------
+        # Always shown whenever something's loaded, independent of whether
+        # the manual queue below has anything in it - answers "what's
+        # playing, and where is it playing from" (a real album/playlist/
+        # mix, or a manually-queued track) before the sections below answer
+        # "what's coming after it". Kept in sync by _refresh_queue_panel(),
+        # called both on every queue mutation and (via refresh_views_if_active)
+        # on every track change while this view happens to be open.
+        now_playing_card = QWidget(page)
+        now_playing_card.setObjectName("QueueNowPlayingCard")
+        # Capped - without this, this card was the widget that ended up
+        # absorbing leftover vertical space whenever both lists below it
+        # were empty/hidden (e.g. a single-track playlist with nothing
+        # manually queued), stretching it into a tall, oddly-spaced-out
+        # mess instead of staying a compact row.
+        now_playing_card.setMaximumHeight(80)
+        now_playing_row = QHBoxLayout(now_playing_card)
+        now_playing_row.setContentsMargins(10, 10, 14, 10)
+        now_playing_row.setSpacing(12)
+
+        self.queue_now_playing_art = QLabel(now_playing_card)
+        self.queue_now_playing_art.setFixedSize(52, 52)
+        self.queue_now_playing_art.setObjectName("QueueNowPlayingArt")
+        self.queue_now_playing_art.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.queue_now_playing_art.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        now_playing_row.addWidget(self.queue_now_playing_art)
+
+        now_playing_text_col = QVBoxLayout()
+        now_playing_text_col.setSpacing(2)
+        self.queue_now_playing_title = ElidingLabel("Nothing playing", now_playing_card)
+        self.queue_now_playing_title.setObjectName("QueueNowPlayingTitle")
+        self.queue_now_playing_subtitle = ElidingLabel("", now_playing_card)
+        self.queue_now_playing_subtitle.setObjectName("QueueNowPlayingSubtitle")
+        now_playing_text_col.addWidget(self.queue_now_playing_title)
+        now_playing_text_col.addWidget(self.queue_now_playing_subtitle)
+        now_playing_row.addLayout(now_playing_text_col, stretch=1)
+
+        # A subtle fade animates in whenever the displayed track actually
+        # changes (see _animate_queue_now_playing_change(), triggered from
+        # _refresh_queue_panel() only when the track identity differs from
+        # last time) - a plain instant text/art swap read as an abrupt
+        # jump-cut every time playback advanced while this view was open.
+        self._queue_now_playing_opacity_effect = QGraphicsOpacityEffect(now_playing_card)
+        self._queue_now_playing_opacity_effect.setOpacity(1.0)
+        now_playing_card.setGraphicsEffect(self._queue_now_playing_opacity_effect)
+        self._queue_now_playing_fade_anim: Optional[QPropertyAnimation] = None
+        self._queue_now_playing_last_path: Optional[str] = None
+
+        layout.addWidget(now_playing_card)
+
+        # --- "Next in Queue" - the manual queue, reorderable ---------------
+        self.queue_next_heading = QLabel("Next in Queue", page)
+        self.queue_next_heading.setObjectName("PinnedSectionHeading")
+        layout.addWidget(self.queue_next_heading)
+
+        # Shown instead of the list while nothing's manually queued -
+        # _refresh_queue_panel() toggles this and queue_list_widget's
+        # visibility together based on whether play_queue has anything in
+        # it.
+        self.queue_empty_label = QLabel(
+            "Nothing manually queued. Right-click any track or album and "
+            "choose \u201cPlay Next\u201d or \u201cAdd to Queue\u201d.", page
+        )
+        self.queue_empty_label.setStyleSheet("font-size: 12px; color: rgba(255,255,255,0.45);")
+        self.queue_empty_label.setWordWrap(True)
+        self.queue_empty_label.setVisible(False)
+        layout.addWidget(self.queue_empty_label)
+
+        # Drag-and-drop reorderable (InternalMove) - _on_queue_reordered()
+        # re-derives self.play_queue's order from the widget afterward.
+        # Capped height (rather than stretch=1) since this is usually a
+        # short, deliberately-added list - "Next from X" below is what
+        # gets the remaining page space.
+        self.queue_list_widget = QListWidget(page)
+        self.queue_list_widget.setObjectName("QueueListWidget")
+        self.queue_list_widget.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.queue_list_widget.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.queue_list_widget.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.queue_list_widget.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.queue_list_widget.setMaximumHeight(220)
+        self.queue_list_widget.model().rowsMoved.connect(self._on_queue_reordered)
+        self.queue_list_widget.itemDoubleClicked.connect(self._handle_queue_item_double_clicked)
+        self.queue_list_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.queue_list_widget.customContextMenuRequested.connect(self._show_queue_context_menu)
+        self.queue_list_widget.setVisible(False)
+        layout.addWidget(self.queue_list_widget)
+
+        # --- "Next from X" - preview of the current context continuing ----
+        # Not reorderable/removable (it's just a preview of an order
+        # that's already determined by the album/playlist/mix itself) -
+        # double-click jumps straight to that track; right-click offers
+        # Play Now plus the same Play Next/Add to Queue/Add to Playlist
+        # actions available everywhere else.
+        self.queue_context_heading = QLabel("", page)
+        self.queue_context_heading.setObjectName("PinnedSectionHeading")
+        self.queue_context_heading.setVisible(False)
+        layout.addWidget(self.queue_context_heading)
+
+        self.queue_context_list_widget = QListWidget(page)
+        self.queue_context_list_widget.setObjectName("QueueListWidget")
+        self.queue_context_list_widget.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.queue_context_list_widget.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.queue_context_list_widget.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.queue_context_list_widget.itemDoubleClicked.connect(self._handle_queue_context_item_double_clicked)
+        self.queue_context_list_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.queue_context_list_widget.customContextMenuRequested.connect(self._show_queue_context_preview_menu)
+        self.queue_context_list_widget.setVisible(False)
+        layout.addWidget(self.queue_context_list_widget, stretch=1)
+
+        # Shown instead of everything above when nothing's loaded at all.
+        self.queue_nothing_playing_label = QLabel(
+            "Nothing's playing yet. Start an album, mix, or playlist, and "
+            "this view will show what's up next.", page
+        )
+        self.queue_nothing_playing_label.setStyleSheet("font-size: 13px; color: rgba(255,255,255,0.5);")
+        self.queue_nothing_playing_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.queue_nothing_playing_label.setWordWrap(True)
+        self.queue_nothing_playing_label.setVisible(False)
+        layout.addWidget(self.queue_nothing_playing_label)
+
+        return page
+
+    def open_queue_view(self):
+        self._refresh_queue_panel()
+        self._enter_detail_view(self.VIEW_QUEUE, self.queue_back_btn)
+
+    def toggle_queue_view(self):
+        if self.view_stack.currentIndex() == self.VIEW_QUEUE:
+            self.close_current_view()
+        else:
+            self.open_queue_view()
+
     def _build_transport_panel(self) -> QWidget:
         bottom_panel = QWidget()
         bottom_panel.setObjectName("BottomPanel")
@@ -4919,6 +5861,21 @@ class AdaptiveMusicPlayer(QMainWindow):
         self.lyrics_btn.setProperty("active", "0")
         volume_layout.addWidget(self.lyrics_btn)
 
+        # Lights up (via the "active" property, same mechanism as
+        # LyricsButton above) whenever the manual play queue has anything
+        # waiting in it - see _refresh_queue_panel(). Toggles the Queue
+        # detail view, same "drop into it, back button returns" pattern
+        # Showcase/Lyrics use.
+        self.queue_btn = QPushButton("\u2630", self)
+        self.queue_btn.setObjectName("QueueButton")
+        self.queue_btn.setFixedSize(36, 36)
+        self.queue_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.queue_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.queue_btn.clicked.connect(self.toggle_queue_view)
+        self.queue_btn.setProperty("active", "0")
+        self.queue_btn.setToolTip("View Queue")
+        volume_layout.addWidget(self.queue_btn)
+
         volume_layout.addSpacing(8)
         
         self.volume_slider = QSlider(Qt.Orientation.Horizontal, self)
@@ -5025,6 +5982,31 @@ class AdaptiveMusicPlayer(QMainWindow):
                 border-radius: 10px;
                 padding: 3px 10px;
                 font-size: 10px;
+            }}
+            QPushButton#PlaylistSortButton {{
+                background-color: rgba(255, 255, 255, 0.06);
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                border-radius: 14px;
+                padding: 6px 14px;
+                font-weight: 600;
+                font-size: 12px;
+                color: rgba(255, 255, 255, 0.75);
+            }}
+            QPushButton#PlaylistSortButton:hover {{
+                background-color: rgba(255, 255, 255, 0.12);
+                color: #FFFFFF;
+            }}
+            QPushButton#NewPlaylistButton {{
+                background-color: rgba(255, 255, 255, 0.1);
+                border: 1px solid rgba(255, 255, 255, 0.14);
+                border-radius: 14px;
+                padding: 6px 16px;
+                font-weight: 700;
+                font-size: 12px;
+                color: #FFFFFF;
+            }}
+            QPushButton#NewPlaylistButton:hover {{
+                background-color: rgba(255, 255, 255, 0.18);
             }}
             QPushButton#TopSongsModeButton {{
                 background-color: rgba(255, 255, 255, 0.06);
@@ -5152,13 +6134,13 @@ class AdaptiveMusicPlayer(QMainWindow):
                 font-size: 16px;
                 color: rgba(255, 255, 255, 0.7);
             }}
-            #BottomPanel QPushButton#LoopButton, #BottomPanel QPushButton#LyricsButton {{
+            #BottomPanel QPushButton#LoopButton, #BottomPanel QPushButton#LyricsButton, #BottomPanel QPushButton#QueueButton {{
                 border-radius: 18px;
                 padding: 0px;
                 font-size: 15px;
                 color: rgba(255, 255, 255, 0.7);
             }}
-            #BottomPanel QPushButton#LoopButton:hover, #BottomPanel QPushButton#LyricsButton:hover {{
+            #BottomPanel QPushButton#LoopButton:hover, #BottomPanel QPushButton#LyricsButton:hover, #BottomPanel QPushButton#QueueButton:hover {{
                 color: #FFFFFF;
             }}
             #BottomPanel QPushButton#PlayButton {{ 
@@ -5171,7 +6153,7 @@ class AdaptiveMusicPlayer(QMainWindow):
             }}
             #BottomPanel QPushButton#PlayButton:hover {{ background-color: rgba(255, 255, 255, 0.88); }}
             
-            QPushButton#LyricsButton[active="1"] {{
+            QPushButton#LyricsButton[active="1"], QPushButton#QueueButton[active="1"] {{
                 background-color: rgba(255, 255, 255, 0.16);
                 border: 1px solid rgba(255, 255, 255, 0.2);
                 color: #FFFFFF;
@@ -5195,7 +6177,54 @@ class AdaptiveMusicPlayer(QMainWindow):
                 border: 1px solid rgba(255, 255, 255, 0.18);
                 color: #FFFFFF;
             }}
-            QWidget#HomePage, QWidget#ArtistsPage {{ background: transparent; }}
+            QPushButton#NavTabButtonSoon {{
+                background-color: transparent;
+                border: 1px solid transparent;
+                color: rgba(255, 255, 255, 0.32);
+                border-radius: 14px;
+                padding: 6px 10px 6px 16px;
+                font-weight: 700;
+                font-size: 13px;
+            }}
+            QPushButton#NavTabButtonSoon:hover {{
+                background-color: rgba(255, 255, 255, 0.06);
+                color: rgba(255, 255, 255, 0.55);
+            }}
+            QLabel#SoonBadge {{
+                background-color: rgba(255, 255, 255, 0.08);
+                color: rgba(255, 255, 255, 0.4);
+                border-radius: 6px;
+                padding: 2px 6px;
+                font-weight: 800;
+                font-size: 9px;
+                letter-spacing: 0.5px;
+            }}
+            QWidget#HomePage, QWidget#ArtistsPage, QWidget#PlaylistsPage, QWidget#QueuePage {{ background: transparent; }}
+            QWidget#QueueNowPlayingCard {{
+                background-color: rgba(255, 255, 255, 0.05);
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 12px;
+            }}
+            QLabel#QueueNowPlayingArt {{
+                background-color: rgba(255, 255, 255, 0.08);
+                border-radius: 8px;
+            }}
+            QLabel#QueueNowPlayingTitle {{
+                font-weight: 800; font-size: 15px; color: #FFFFFF;
+            }}
+            QLabel#QueueNowPlayingSubtitle {{
+                font-weight: 500; font-size: 12px; color: rgba(255,255,255,0.55);
+            }}
+            QLabel#QueueRowArt {{
+                background-color: rgba(255, 255, 255, 0.08);
+                border-radius: 6px;
+            }}
+            QLabel#QueueRowTitle {{
+                font-weight: 700; font-size: 13px; color: #FFFFFF;
+            }}
+            QLabel#QueueRowArtist {{
+                font-weight: 500; font-size: 11px; color: rgba(255,255,255,0.55);
+            }}
             QPushButton#ShelfNavButton {{
                 background-color: rgba(255, 255, 255, 0.06);
                 border: 1px solid rgba(255, 255, 255, 0.08);
@@ -5219,6 +6248,15 @@ class AdaptiveMusicPlayer(QMainWindow):
             }}
             QListWidget::item {{ color: #FFFFFF; border: none; border-radius: 8px; padding: 6px; }}
             QListWidget::item:hover {{ background-color: {panel_hover}; }}
+
+            QListWidget#QueueListWidget::item {{
+                padding: 0px;
+                margin: 0px;
+                border: none;
+                background: transparent;
+            }}
+            QListWidget#QueueListWidget::item:hover {{ background-color: {panel_hover}; }}
+            QListWidget#QueueListWidget::item:selected {{ background: transparent; }}
 
             QListWidget#AlbumGrid::item {{
                 padding: 0px;
@@ -5351,16 +6389,25 @@ class AdaptiveMusicPlayer(QMainWindow):
         "album_rewind":        ("\u27F2", QColor(150, 96, 56), QColor(64, 38, 28)),    # circular arrow - vinyl brown
         "month_rewind":        ("\u2605", QColor(186, 58, 186), QColor(58, 20, 88)),   # star - wrapped magenta
         "artist_top":          ("\u2605", QColor(180, 140, 40), QColor(80, 56, 12)),   # star - gold, an artist's own Top Songs mix
+        "playlist":            ("\u2630", QColor(46, 125, 96), QColor(18, 54, 44)),    # list glyph - emerald, user-created playlists
     }
 
-    def generate_mix_cover_pixmap(self, style: str = "replay", size: int = COVER_SIZE, radius: int = 8) -> QPixmap:
+    def generate_mix_cover_pixmap(self, style: str = "replay", size: int = COVER_SIZE, radius: int = 8,
+                                   override_colors: Optional[tuple] = None) -> QPixmap:
         # A generated cover for smart-mix "albums" that aren't real
         # scanned folders (e.g. Replay Mix) - a gradient tile with a
         # glyph, visually distinct enough to read as "this one's
         # different" from a real album cover. `style` looks up
         # MIX_STYLES so every mix gets its own glyph/gradient rather than
-        # sharing one look.
+        # sharing one look. override_colors, if given, replaces just the
+        # (color_a, color_b) pair while keeping that style's glyph - used
+        # by playlists (see _playlist_cover_colors()) so every playlist
+        # still reads as "a playlist" (same list glyph) while each one
+        # gets its own distinct color instead of all sharing MIX_STYLES'
+        # one fixed "playlist" gradient.
         glyph, color_a, color_b = self.MIX_STYLES.get(style, self.MIX_STYLES["replay"])
+        if override_colors is not None:
+            color_a, color_b = override_colors
         pixmap = QPixmap(size, size)
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -5375,14 +6422,25 @@ class AdaptiveMusicPlayer(QMainWindow):
         painter.end()
         return self.make_pixmap_rounded(pixmap, radius=radius)
 
+    def _is_synthetic_playback_key(self, key: Optional[str]) -> bool:
+        # True for any "album" that isn't a real scanned folder - a smart
+        # mix, a user playlist, or the ephemeral single-track queue
+        # context (see QUEUE_KEY) - all of which can span tracks from many
+        # different real albums, so (like the smart-mix-only check this
+        # generalizes) a specific track's own embedded cover art makes
+        # more sense to display than one generated tile pretending to
+        # represent the whole thing.
+        return bool(key) and (
+            key.startswith("__mix__") or key.startswith(self.PLAYLIST_KEY_PREFIX) or key == self.QUEUE_KEY
+        )
+
     def _current_display_cover_bytes(self) -> Optional[bytes]:
         # A virtual mix (Replay Mix etc.) has no single real cover of its
         # own - album_display_meta's cover_bytes for it is just None - so
         # Showcase/Lyrics need this specific track's own embedded art
         # instead (cached in play_track_at, not re-read here). Regular
         # albums just use the album's own cover_bytes as before.
-        is_virtual_mix = bool(self.active_playing_album_key) and self.active_playing_album_key.startswith("__mix__")
-        if is_virtual_mix:
+        if self._is_synthetic_playback_key(self.active_playing_album_key):
             return self._current_track_cover_bytes
         meta = self.album_display_meta.get(self.active_playing_album_key)
         return meta.get("cover_bytes") if meta else None
@@ -5605,6 +6663,7 @@ class AdaptiveMusicPlayer(QMainWindow):
 
         self.refresh_home_shelves()
         self.refresh_artist_grid()
+        self.rebuild_playlist_grid()
 
     def get_track_title(self, path: str) -> str:
         # Prefers the real embedded title tag (e.g. from Picard) over the
@@ -5693,14 +6752,61 @@ class AdaptiveMusicPlayer(QMainWindow):
         self._refresh_now_playing_outlines(force=True)
 
     def show_album_card_context_menu(self, card: AlbumCardWidget):
-        if card.mode != "album" or not card.album_key or card.album_key.startswith("__mix__"):
+        # Playlist tiles (card.mode == "playlist") are handled entirely by
+        # their own show_playlist_card_context_menu instead - they're
+        # never routed through here, since they need Rename/Delete rather
+        # than Pin/Unpin.
+        if card.mode == "album":
+            if not card.album_key or card.album_key.startswith("__mix__"):
+                return  # a smart mix's tile isn't pinnable/queueable as "an album"
+            is_pinned = card.album_key in self.pinned_album_keys
+            menu = QMenu(self)
+            action = QAction("Unpin" if is_pinned else "Pin to top", self)
+            action.triggered.connect(lambda checked=False, key=card.album_key: self.toggle_album_pin(key))
+            menu.addAction(action)
+            menu.addSeparator()
+            self._add_queue_and_playlist_actions(menu, self.album_tracks.get(card.album_key, []))
+            menu.exec(QCursor.pos())
+        elif card.mode == "track" and card.track_path:
+            # A single-track card (a Home shelf single, a Jump Back In
+            # track, or a search result) - no Pin option (that's an
+            # album-level concept), just the same queue/playlist actions
+            # for this one track.
+            menu = QMenu(self)
+            self._add_queue_and_playlist_actions(menu, [card.track_path])
+            menu.exec(QCursor.pos())
+
+    def _add_queue_and_playlist_actions(self, menu: QMenu, track_paths: list):
+        # Shared by every place a person can right-click one or more
+        # tracks (album cards, single-track cards, playlist cards, and
+        # song_list_widget rows) - "Play Next"/"Add to Queue" for the
+        # session-only play queue, plus an "Add to Playlist" submenu
+        # listing every saved playlist and a "New Playlist..." shortcut
+        # that creates one already containing these tracks.
+        if not track_paths:
             return
-        is_pinned = card.album_key in self.pinned_album_keys
-        menu = QMenu(self)
-        action = QAction("Unpin" if is_pinned else "Pin to top", self)
-        action.triggered.connect(lambda checked=False, key=card.album_key: self.toggle_album_pin(key))
-        menu.addAction(action)
-        menu.exec(QCursor.pos())
+
+        play_next_action = QAction("Play Next", self)
+        play_next_action.triggered.connect(lambda checked=False, paths=track_paths: self.play_next_tracks(paths))
+        menu.addAction(play_next_action)
+
+        add_queue_action = QAction("Add to Queue", self)
+        add_queue_action.triggered.connect(lambda checked=False, paths=track_paths: self.add_tracks_to_queue(paths))
+        menu.addAction(add_queue_action)
+
+        playlist_menu = menu.addMenu("Add to Playlist")
+        ordered = sorted(self.user_playlists.items(), key=lambda kv: kv[1]["name"].lower())
+        for playlist_id, record in ordered:
+            action = QAction(record["name"], self)
+            action.triggered.connect(
+                lambda checked=False, pid=playlist_id, paths=track_paths: self.add_tracks_to_playlist(pid, paths)
+            )
+            playlist_menu.addAction(action)
+        if ordered:
+            playlist_menu.addSeparator()
+        new_playlist_action = QAction("New Playlist...", self)
+        new_playlist_action.triggered.connect(lambda checked=False, paths=track_paths: self.prompt_new_playlist(paths))
+        playlist_menu.addAction(new_playlist_action)
 
     def toggle_album_pin(self, key: str):
         if key in self.pinned_album_keys:
@@ -5776,6 +6882,8 @@ class AdaptiveMusicPlayer(QMainWindow):
         grids = [self.album_grid, self.pinned_grid]
         if hasattr(self, "home_shelves"):
             grids.extend(grid for _container, grid in self.home_shelves.values())
+        if hasattr(self, "playlist_grid"):
+            grids.append(self.playlist_grid)
         return grids
 
     def _refresh_now_playing_outlines(self, force: bool = False):
@@ -5802,14 +6910,14 @@ class AdaptiveMusicPlayer(QMainWindow):
 
         matches = []
         if self.active_playing_album_key:
-            # Only "album" mode cards are eligible - a "track" mode card
-            # (a single song on a Home shelf or in search results) isn't
-            # itself playing just because the album it's from happens to
-            # be.
+            # Only "album"/"playlist" mode cards are eligible - a "track"
+            # mode card (a single song on a Home shelf or in search
+            # results) isn't itself playing just because the album it's
+            # from happens to be.
             for grid in self._all_grids_with_cards():
                 for i in range(grid.count()):
                     widget = grid.itemWidget(grid.item(i))
-                    if isinstance(widget, AlbumCardWidget) and widget.mode == "album" and widget.album_key == self.active_playing_album_key:
+                    if isinstance(widget, AlbumCardWidget) and widget.mode in ("album", "playlist") and widget.album_key == self.active_playing_album_key:
                         widget.set_now_playing(True)
                         widget.set_accent(self._current_accent)
                         matches.append(widget)
@@ -5952,6 +7060,29 @@ class AdaptiveMusicPlayer(QMainWindow):
         self._start_playing_browsed_album()
         self.play_track_at(row)
 
+    def _show_song_list_context_menu(self, pos):
+        item = self.song_list_widget.itemAt(pos)
+        if item is None:
+            return
+        row = self.song_list_widget.row(item)
+        if not (0 <= row < len(self.browsing_tracks)):
+            return
+        path = self.browsing_tracks[row]
+
+        menu = QMenu(self)
+        self._add_queue_and_playlist_actions(menu, [path])
+
+        if self.browsing_album_key and self.browsing_album_key.startswith(self.PLAYLIST_KEY_PREFIX):
+            playlist_id = self.browsing_album_key[len(self.PLAYLIST_KEY_PREFIX):]
+            menu.addSeparator()
+            remove_action = QAction("Remove from Playlist", self)
+            remove_action.triggered.connect(
+                lambda checked=False, pid=playlist_id, r=row: self.remove_track_from_playlist_at(pid, r)
+            )
+            menu.addAction(remove_action)
+
+        menu.exec(self.song_list_widget.viewport().mapToGlobal(pos))
+
     def play_track_at(self, row: int, autoplay: bool = True, resume_position_ms: int = 0):
         if not (0 <= row < len(self.active_playing_tracks)):
             return
@@ -6014,16 +7145,18 @@ class AdaptiveMusicPlayer(QMainWindow):
 
         self.now_playing_artist_label.setText(final_artist)
 
-        # A virtual mix (e.g. Replay Mix) spans tracks from many different
-        # real albums, so its own generated tile wouldn't mean anything as
-        # "now playing" art - use this specific track's actual embedded
-        # cover instead, falling back to the mix's generic tile only if
-        # this particular track has no cover of its own. Regular albums
-        # just use the already-decoded, cached album pixmap (same image
-        # in practice, cheaper than re-decoding it from every track).
-        is_virtual_mix = bool(self.active_playing_album_key) and self.active_playing_album_key.startswith("__mix__")
+        # A virtual mix (e.g. Replay Mix), an opened playlist, or a
+        # manually-queued track (see QUEUE_KEY) can all span tracks from
+        # many different real albums, so a single generated/cached tile
+        # wouldn't mean anything as "now playing" art - use this specific
+        # track's actual embedded cover instead, falling back to the
+        # generic tile only if this particular track has no cover of its
+        # own. Regular albums just use the already-decoded, cached album
+        # pixmap (same image in practice, cheaper than re-decoding it from
+        # every track).
+        is_synthetic = self._is_synthetic_playback_key(self.active_playing_album_key)
         display_pixmap = None
-        if is_virtual_mix and extracted_cover_bytes:
+        if is_synthetic and extracted_cover_bytes:
             display_pixmap = self.cover_bytes_to_pixmap(extracted_cover_bytes)
         elif meta and meta.get("pixmap") is not None:
             display_pixmap = meta["pixmap"]
@@ -6093,6 +7226,27 @@ class AdaptiveMusicPlayer(QMainWindow):
             self.play_track_at(self.current_track_index - 1)
 
     def play_next(self):
+        # The manual queue always wins - "Play Next"/"Add to Queue" is a
+        # deliberate, explicit interruption, so it takes priority over
+        # shuffle/repeat and whatever album/mix/playlist would otherwise
+        # play next.
+        if self.play_queue:
+            self._play_next_from_queue()
+            return
+
+        if self.active_playing_album_key == self.QUEUE_KEY and self._queue_return_context is not None:
+            # The queue just drained on the track that finished - hand
+            # playback back to wherever regular context (the album/mix/
+            # playlist that was interrupted) left off, then fall straight
+            # through into the exact same advance logic below, as if the
+            # queue had never intervened.
+            tracks, album_key, index = self._queue_return_context
+            self._queue_return_context = None
+            self.active_playing_tracks = tracks
+            self.active_playing_album_key = album_key
+            self.current_track_index = index
+            self._refresh_now_playing_outlines()
+
         if self.playback_mode == 3 and len(self.active_playing_tracks) > 1:
             candidates = [i for i in range(len(self.active_playing_tracks)) if i != self.current_track_index]
             self.play_track_at(random.choice(candidates))
@@ -6109,6 +7263,337 @@ class AdaptiveMusicPlayer(QMainWindow):
                 self._mpris_notify({"PlaybackStatus": "Stopped"})
                 if HAS_DBUS_PYTHON:
                     self._mpris_position_timer.stop()
+
+    # --------------------------------------------------------- Play queue --
+    def _play_next_from_queue(self):
+        if self.active_playing_album_key != self.QUEUE_KEY:
+            # First dip into the queue since regular playback last
+            # advanced on its own - remember exactly where to resume once
+            # the queue drains. If we're already mid-queue (consuming a
+            # second/third queued track in a row), the real context to
+            # return to was already captured on the way in.
+            self._queue_return_context = (
+                list(self.active_playing_tracks), self.active_playing_album_key, self.current_track_index,
+            )
+        path = self.play_queue.pop(0)
+        self._refresh_queue_panel()
+        if not os.path.exists(path):
+            self.status_label.setText(f"File missing, skipping: {os.path.basename(path)}")
+            self.status_label.setVisible(True)
+            self.play_next()  # try the next queued item, or fall through to restoring context
+            return
+        self.active_playing_tracks = [path]
+        self.active_playing_album_key = self.QUEUE_KEY
+        self._refresh_now_playing_outlines()
+        self.play_track_at(0)
+
+    def _play_queue_item_at(self, index: int):
+        # "Play Now" from the queue view - jumps straight to that item,
+        # the same as if everything ahead of it in the queue had already
+        # played through and been consumed.
+        if not (0 <= index < len(self.play_queue)):
+            return
+        if self.active_playing_album_key != self.QUEUE_KEY:
+            self._queue_return_context = (
+                list(self.active_playing_tracks), self.active_playing_album_key, self.current_track_index,
+            )
+        del self.play_queue[:index]
+        path = self.play_queue.pop(0)
+        self._refresh_queue_panel()
+        if not os.path.exists(path):
+            self.status_label.setText(f"File missing, skipping: {os.path.basename(path)}")
+            self.status_label.setVisible(True)
+            self.play_next()
+            return
+        self.active_playing_tracks = [path]
+        self.active_playing_album_key = self.QUEUE_KEY
+        self._refresh_now_playing_outlines()
+        self.play_track_at(0)
+
+    def play_next_tracks(self, track_paths: list):
+        # Inserts at the very front of the queue, so these play
+        # immediately after whatever's currently playing - ahead of
+        # anything already waiting.
+        existing = [p for p in track_paths if os.path.exists(p)]
+        if not existing:
+            return
+        self.play_queue[0:0] = existing
+        self._refresh_queue_panel()
+        self._pulse_queue_rows(range(0, len(existing)))
+        noun = "track" if len(existing) == 1 else "tracks"
+        self.status_label.setText(f"Playing next: {len(existing)} {noun}")
+        self.status_label.setVisible(True)
+
+    def add_tracks_to_queue(self, track_paths: list):
+        existing = [p for p in track_paths if os.path.exists(p)]
+        if not existing:
+            return
+        start = len(self.play_queue)
+        self.play_queue.extend(existing)
+        self._refresh_queue_panel()
+        self._pulse_queue_rows(range(start, start + len(existing)))
+        noun = "track" if len(existing) == 1 else "tracks"
+        self.status_label.setText(f"Added to queue: {len(existing)} {noun}")
+        self.status_label.setVisible(True)
+
+    def _remove_from_queue_at(self, row: int):
+        if 0 <= row < len(self.play_queue):
+            del self.play_queue[row]
+            self._refresh_queue_panel()
+
+    def clear_queue(self):
+        self.play_queue = []
+        self._refresh_queue_panel()
+
+    def _effective_playback_context(self) -> tuple:
+        # (tracks, album_key, current_index) - the "real" playback context
+        # that the manual queue will eventually hand playback back to once
+        # it drains (see play_next()), whether or not we're actually
+        # mid-queue right now. Used to preview what's coming up after the
+        # queue empties out, rather than just going blank while a manually
+        # queued track happens to be what's sounding this exact moment.
+        if self.active_playing_album_key == self.QUEUE_KEY and self._queue_return_context is not None:
+            return self._queue_return_context
+        return self.active_playing_tracks, self.active_playing_album_key, self.current_track_index
+
+    def _compute_upcoming_context_tracks(self) -> list:
+        tracks, _album_key, index = self._effective_playback_context()
+        if not tracks or index < 0:
+            return []
+        return tracks[index + 1:]
+
+    def _effective_playback_context_label(self) -> str:
+        _tracks, album_key, _index = self._effective_playback_context()
+        meta = self.album_display_meta.get(album_key)
+        return meta.get("title", "") if meta else ""
+
+    def _queue_row_art_pixmap(self, source_pixmap: Optional[QPixmap], size: int, radius: int) -> QPixmap:
+        # Paints straight onto a fresh, guaranteed-exact size x size
+        # canvas in one pass - the same direct approach cover_bytes_to_pixmap
+        # already uses for every other cover in the app - rather than
+        # chaining separate scaled()/copy() calls on an already-processed
+        # cached pixmap, which could compound rounding/DPI quirks from
+        # however that pixmap was produced upstream (e.g. a smart mix's
+        # generated tile, or a real album cover already scaled once at
+        # COVER_SIZE) into a mis-sized or misaligned result.
+        target = QPixmap(size, size)
+        target.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(target)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        clip_path = QPainterPath()
+        clip_path.addRoundedRect(0, 0, size, size, radius, radius)
+        painter.setClipPath(clip_path)
+
+        if source_pixmap is not None and not source_pixmap.isNull():
+            # Scale so the shorter side exactly fills `size`, then draw
+            # centered - covers the whole target (KeepAspectRatioByExpanding),
+            # cropping evenly on whichever axis overflows.
+            scaled = source_pixmap.scaled(
+                size, size, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation,
+            )
+            x = (scaled.width() - size) // 2
+            y = (scaled.height() - size) // 2
+            painter.drawPixmap(-x, -y, scaled)
+        else:
+            painter.fillRect(0, 0, size, size, QColor(38, 42, 50))
+
+        painter.end()
+        return target
+
+    def _animate_queue_now_playing_change(self):
+        # A quick dip-and-recover opacity flash on the Now Playing card,
+        # triggered only when the actually-displayed track changes (see
+        # the track_changed check in _refresh_queue_panel) - signals "this
+        # just updated" instead of the text/art silently swapping out from
+        # under you mid-glance.
+        if not hasattr(self, "_queue_now_playing_opacity_effect"):
+            return
+        if self._queue_now_playing_fade_anim is not None and self._queue_now_playing_fade_anim.state() == QPropertyAnimation.State.Running:
+            self._queue_now_playing_fade_anim.stop()
+        self._queue_now_playing_opacity_effect.setOpacity(0.35)
+        anim = QPropertyAnimation(self._queue_now_playing_opacity_effect, b"opacity", self)
+        anim.setDuration(280)
+        anim.setStartValue(0.35)
+        anim.setEndValue(1.0)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._queue_now_playing_fade_anim = anim
+        anim.start()
+
+    def _pulse_queue_rows(self, indices):
+        # Flashes the just-added row(s) in "Next in Queue" - visual
+        # confirmation of exactly what landed where, right after a
+        # Play Next/Add to Queue action. Called right after
+        # _refresh_queue_panel() has freshly (re)built the row widgets, so
+        # these are guaranteed to be brand new instances, not ones about
+        # to be immediately torn down.
+        if not hasattr(self, "queue_list_widget"):
+            return
+        for i in indices:
+            item = self.queue_list_widget.item(i)
+            if item is None:
+                continue
+            widget = self.queue_list_widget.itemWidget(item)
+            if isinstance(widget, QueueTrackRowWidget):
+                widget.play_click_pulse()
+
+    def _build_queue_row_widget(self, path: str) -> QueueTrackRowWidget:
+        # Cover art + title + artist - the same shape the Now Playing card
+        # above these lists uses, rather than a bare text line. Reuses
+        # whatever pixmap is already cached for this track's real album
+        # (decoded once at scan time) instead of re-reading the file.
+        title = self.get_track_title(path)
+        album_key = self.track_to_album_key.get(path)
+        meta = self.album_display_meta.get(album_key) if album_key else None
+        artist_name = (meta.get("artist") if meta else None) or "Unknown Artist"
+        pixmap = self._queue_row_art_pixmap(meta["pixmap"] if meta else None, size=40, radius=6)
+        return QueueTrackRowWidget(pixmap, title, artist_name)
+
+    def _refresh_queue_panel(self):
+        # Lights up queue_btn whenever anything's manually queued,
+        # independent of whether the queue view itself is currently open -
+        # a quick visual "yes, something's queued" affordance from the
+        # transport bar. Only pulses on the empty->non-empty transition
+        # (not every refresh) - that's the one moment worth calling
+        # attention to; reordering/removing items shouldn't re-flash it.
+        if hasattr(self, "queue_btn"):
+            is_active = bool(self.play_queue)
+            self.queue_btn.setProperty("active", "1" if is_active else "0")
+            self.queue_btn.style().unpolish(self.queue_btn)
+            self.queue_btn.style().polish(self.queue_btn)
+
+        if not hasattr(self, "queue_list_widget"):
+            return  # UI not built yet - called too early during init
+
+        has_current_track = 0 <= self.current_track_index < len(self.active_playing_tracks)
+        current_path = self.active_playing_tracks[self.current_track_index] if has_current_track else None
+        track_changed = current_path != self._queue_now_playing_last_path
+        self._queue_now_playing_last_path = current_path
+
+        # --- Now Playing card -----------------------------------------
+        # Same plain "track title / artist" format as every row below it -
+        # no "Playing from X" here (that context is what the "Next from X"
+        # section heading is for).
+        self.queue_now_playing_art.setVisible(has_current_track)
+        if has_current_track:
+            self.queue_now_playing_art.setPixmap(
+                self._queue_row_art_pixmap(self.now_playing_art.pixmap(), size=52, radius=8)
+            )
+            self.queue_now_playing_title.setText(self.now_playing_label.text() or "Nothing playing")
+            self.queue_now_playing_subtitle.setText(self.now_playing_artist_label.text())
+        else:
+            self.queue_now_playing_title.setText("Nothing playing")
+            self.queue_now_playing_subtitle.setText("")
+
+        if track_changed:
+            self._animate_queue_now_playing_change()
+
+        # --- "Next in Queue" (the manual queue, reorderable) -----------
+        self.queue_list_widget.blockSignals(True)
+        self.queue_list_widget.clear()
+        for path in self.play_queue:
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, path)
+            item.setSizeHint(QSize(0, 54))
+            self.queue_list_widget.addItem(item)
+            self.queue_list_widget.setItemWidget(item, self._build_queue_row_widget(path))
+        self.queue_list_widget.blockSignals(False)
+
+        has_queue_items = bool(self.play_queue)
+        queue_count = len(self.play_queue)
+        self.queue_next_heading.setText(
+            f"Next in Queue \u2014 {queue_count} track{'s' if queue_count != 1 else ''}" if has_queue_items else "Next in Queue"
+        )
+        self.queue_empty_label.setVisible(not has_queue_items)
+        self.queue_list_widget.setVisible(has_queue_items)
+        self.queue_clear_btn.setEnabled(has_queue_items)
+
+        # --- "Next from X" (preview of the current context continuing) --
+        upcoming = self._compute_upcoming_context_tracks()
+        self.queue_context_list_widget.clear()
+        for path in upcoming:
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, path)
+            item.setSizeHint(QSize(0, 54))
+            self.queue_context_list_widget.addItem(item)
+            self.queue_context_list_widget.setItemWidget(item, self._build_queue_row_widget(path))
+
+        has_upcoming = bool(upcoming)
+        context_label = self._effective_playback_context_label()
+        self.queue_context_heading.setText(f"Next from {context_label}" if context_label else "Next Up")
+        self.queue_context_heading.setVisible(has_upcoming)
+        self.queue_context_list_widget.setVisible(has_upcoming)
+
+        # --- Overall empty state -----------------------------------------
+        # Only when there's truly nothing to show anywhere - something
+        # loaded (even just paused, with nothing queued or upcoming) still
+        # counts as "there's a Now Playing card to show".
+        self.queue_nothing_playing_label.setVisible(not has_current_track and not has_queue_items and not has_upcoming)
+
+    def _on_queue_reordered(self, *args):
+        # Drag-and-drop reordering inside queue_list_widget (InternalMove)
+        # already moved the on-screen rows themselves by the time this
+        # fires - just re-derive self.play_queue's order (the actual
+        # source of truth play_next()/_play_next_from_queue() read from)
+        # from whatever order the items now sit in, rather than clearing
+        # and rebuilding the widget mid-drag.
+        self.play_queue = [
+            self.queue_list_widget.item(i).data(Qt.ItemDataRole.UserRole)
+            for i in range(self.queue_list_widget.count())
+        ]
+
+    def _handle_queue_item_double_clicked(self, item: QListWidgetItem):
+        self._play_queue_item_at(self.queue_list_widget.row(item))
+
+    def _show_queue_context_menu(self, pos):
+        item = self.queue_list_widget.itemAt(pos)
+        if item is None:
+            return
+        row = self.queue_list_widget.row(item)
+        menu = QMenu(self)
+        play_now_action = QAction("Play Now", self)
+        play_now_action.triggered.connect(lambda checked=False, r=row: self._play_queue_item_at(r))
+        menu.addAction(play_now_action)
+        remove_action = QAction("Remove from Queue", self)
+        remove_action.triggered.connect(lambda checked=False, r=row: self._remove_from_queue_at(r))
+        menu.addAction(remove_action)
+        menu.exec(self.queue_list_widget.viewport().mapToGlobal(pos))
+
+    def _handle_queue_context_item_double_clicked(self, item: QListWidgetItem):
+        self._play_upcoming_context_track_at(self.queue_context_list_widget.row(item))
+
+    def _play_upcoming_context_track_at(self, row: int):
+        # "Play Now" on a "Next from X" preview row - jumps straight to
+        # that track in its real context (not through the manual queue),
+        # the same as if you'd let everything before it play out normally.
+        # Whatever's still in the manual queue is untouched and still
+        # plays next after this once it finishes, same priority rule
+        # play_next() always applies.
+        tracks, album_key, current_index = self._effective_playback_context()
+        if not album_key or album_key == self.QUEUE_KEY:
+            return  # nothing real to jump back into
+        target_index = current_index + 1 + row
+        if not (0 <= target_index < len(tracks)):
+            return
+        self.active_playing_tracks = list(tracks)
+        self.active_playing_album_key = album_key
+        self._queue_return_context = None  # we've now returned to this context directly
+        self._refresh_now_playing_outlines()
+        self.play_track_at(target_index)
+
+    def _show_queue_context_preview_menu(self, pos):
+        item = self.queue_context_list_widget.itemAt(pos)
+        if item is None:
+            return
+        row = self.queue_context_list_widget.row(item)
+        path = item.data(Qt.ItemDataRole.UserRole)
+        menu = QMenu(self)
+        play_now_action = QAction("Play Now", self)
+        play_now_action.triggered.connect(lambda checked=False, r=row: self._play_upcoming_context_track_at(r))
+        menu.addAction(play_now_action)
+        menu.addSeparator()
+        self._add_queue_and_playlist_actions(menu, [path])
+        menu.exec(self.queue_context_list_widget.viewport().mapToGlobal(pos))
 
 
 # ------------------------------------------------------------- Last.FM Scrobble Operations --
@@ -6373,8 +7858,12 @@ class AdaptiveMusicPlayer(QMainWindow):
 
     def get_recently_added_albums(self, limit: int = 12) -> list:
         # Local stand-in for "new releases" - sorted by folder mtime (see
-        # LibraryScanner), most recent first.
-        keys = [k for k, meta in self.album_display_meta.items() if meta.get("added_ts")]
+        # LibraryScanner), most recent first. Restricted to sorted_album_keys
+        # (real scanned albums only) - a smart mix's added_ts is always 0
+        # (so it could never qualify here anyway), but a playlist's added_ts
+        # is a real, meaningful creation timestamp, and would otherwise get
+        # mistaken for "a new album" the moment it's created.
+        keys = [k for k in self.sorted_album_keys if self.album_display_meta.get(k, {}).get("added_ts")]
         keys.sort(key=lambda k: self.album_display_meta[k].get("added_ts", 0), reverse=True)
         return keys[:limit]
 
@@ -6735,7 +8224,7 @@ class AdaptiveMusicPlayer(QMainWindow):
         # active_top_level_tab already holds the right answer, and
         # switching Showcase->Lyrics shouldn't overwrite it with
         # "Showcase", since Showcase isn't a tab itself.
-        if self.view_stack.currentIndex() in (self.TAB_HOME, self.TAB_LIBRARY, self.TAB_ARTISTS):
+        if self.view_stack.currentIndex() in (self.TAB_HOME, self.TAB_LIBRARY, self.TAB_ARTISTS, self.TAB_PLAYLISTS):
             self.active_top_level_tab = self.view_stack.currentIndex()
         back_btn.setText(f"\u2190  {self.TAB_NAMES[self.active_top_level_tab]}")
         self._set_nav_tab_bar_visible(False)
@@ -7182,11 +8671,15 @@ class AdaptiveMusicPlayer(QMainWindow):
             self.open_showcase_view()
         elif self.view_stack.currentIndex() == self.VIEW_LYRICS:
             self.open_lyrics_view()
+        elif self.view_stack.currentIndex() == self.VIEW_QUEUE:
+            self._refresh_queue_panel()
 
 # ------------------------------------------------------------ Playback --
     def toggle_play(self):
         if self.player.source().isEmpty():
-            if self.song_list_widget.count() > 0:
+            if self.play_queue:
+                self._play_next_from_queue()
+            elif self.song_list_widget.count() > 0:
                 self._start_playing_browsed_album()
                 self.play_track_at(0)
             return
