@@ -491,6 +491,7 @@ class ArtistImageFetcher(QThread):
             # best-effort I/O.
             return None
 
+
 # --------------------------------------------------------------------------
 # Artist bio + public listener/scrobble stats, and (optionally) top tracks
 # by global scrobble count, for the Artist detail panel - both Last.fm
@@ -503,11 +504,13 @@ class ArtistImageFetcher(QThread):
 class ArtistInfoFetcher(QThread):
     info_fetched = pyqtSignal(str, str, str, str)  # artist name, bio text, listeners, playcount
     top_tracks_fetched = pyqtSignal(str, list)  # artist name, [{"title": str, "playcount": str}, ...]
+    top_albums_fetched = pyqtSignal(str, list)  # artist name, [album name, ...] ranked by Last.fm listeners, most first
 
-    def __init__(self, artist_name: str, fetch_top_tracks: bool = False):
+    def __init__(self, artist_name: str, fetch_top_tracks: bool = False, fetch_top_albums: bool = False):
         super().__init__()
         self.artist_name = artist_name
         self.fetch_top_tracks = fetch_top_tracks
+        self.fetch_top_albums = fetch_top_albums
 
     def run(self):
         try:
@@ -534,29 +537,64 @@ class ArtistInfoFetcher(QThread):
             # uses above for a missing/unreachable photo.
             pass
 
-        if not self.fetch_top_tracks:
-            return
-        try:
-            query = urllib.parse.quote(self.artist_name)
-            url = (
-                "https://ws.audioscrobbler.com/2.0/"
-                f"?method=artist.gettoptracks&artist={query}&api_key={LASTFM_API_KEY}"
-                "&format=json&autocorrect=1&limit=15"
-            )
-            req = urllib.request.Request(url, headers={"User-Agent": "RoPlayer/1.0"})
-            with urllib.request.urlopen(req, timeout=6) as response:
-                data = json.loads(response.read().decode("utf-8"))
-            raw_tracks = ((data.get("toptracks", {}) or {}).get("track", [])) or []
-            tracks = [
-                {"title": t.get("name", ""), "playcount": t.get("playcount", "") or ""}
-                for t in raw_tracks if t.get("name")
-            ]
-            if tracks:
-                self.top_tracks_fetched.emit(self.artist_name, tracks)
-        except Exception:
-            # Non-fatal, same as above - Top Songs just stays empty/stale
-            # for this artist rather than the whole fetch failing.
-            pass
+        if self.fetch_top_tracks:
+            try:
+                query = urllib.parse.quote(self.artist_name)
+                url = (
+                    "https://ws.audioscrobbler.com/2.0/"
+                    f"?method=artist.gettoptracks&artist={query}&api_key={LASTFM_API_KEY}"
+                    "&format=json&autocorrect=1&limit=15"
+                )
+                req = urllib.request.Request(url, headers={"User-Agent": "RoPlayer/1.0"})
+                with urllib.request.urlopen(req, timeout=6) as response:
+                    data = json.loads(response.read().decode("utf-8"))
+                raw_tracks = ((data.get("toptracks", {}) or {}).get("track", [])) or []
+                tracks = [
+                    {"title": t.get("name", ""), "playcount": t.get("playcount", "") or ""}
+                    for t in raw_tracks if t.get("name")
+                ]
+                if tracks:
+                    self.top_tracks_fetched.emit(self.artist_name, tracks)
+            except Exception:
+                # Non-fatal, same as above - Top Songs just stays empty/stale
+                # for this artist rather than the whole fetch failing.
+                pass
+
+        if self.fetch_top_albums:
+            try:
+                # Last.fm doesn't offer a genuinely time-windowed ("this
+                # week") version of this for a single artist - chart.*
+                # is global-only across every artist, and
+                # artist.getTopAlbums itself has never supported a date
+                # range, only an all-time ranking. This is the closest
+                # real "what fans actually listen to most" signal that's
+                # actually available without needing a paid/OAuth-gated
+                # API (e.g. Spotify) - the community's all-time favorite
+                # by scrobble count, not a fabricated "this week" claim
+                # from data that was never week-scoped to begin with.
+                # Several candidates, not just #1 - Last.fm's top result
+                # for an artist is sometimes a "Greatest Hits"/"Best Of"
+                # compilation that isn't actually in someone's own
+                # library, so the caller tries each in rank order against
+                # what's actually owned locally (see
+                # _resolve_fan_favorite_album_key).
+                query = urllib.parse.quote(self.artist_name)
+                url = (
+                    "https://ws.audioscrobbler.com/2.0/"
+                    f"?method=artist.gettopalbums&artist={query}&api_key={LASTFM_API_KEY}"
+                    "&format=json&autocorrect=1&limit=10"
+                )
+                req = urllib.request.Request(url, headers={"User-Agent": "RoPlayer/1.0"})
+                with urllib.request.urlopen(req, timeout=6) as response:
+                    data = json.loads(response.read().decode("utf-8"))
+                raw_albums = ((data.get("topalbums", {}) or {}).get("album", [])) or []
+                album_names = [a.get("name", "") for a in raw_albums if a.get("name")]
+                if album_names:
+                    self.top_albums_fetched.emit(self.artist_name, album_names)
+            except Exception:
+                # Non-fatal, same as above - the flame badge just stays
+                # off for this artist rather than the whole fetch failing.
+                pass
 
     @staticmethod
     def _clean_bio(bio_html: str) -> str:
@@ -888,13 +926,13 @@ class SettingsDialog(QDialog):
                 border: none;
                 border-right: 1px solid rgba(255,255,255,0.06);
                 outline: none;
-                padding: 10px 0px;
+                padding: 16px 0px;
             }}
             QListWidget::item {{
                 color: rgba(255,255,255,0.55);
                 font-weight: 600;
                 font-size: 12px;
-                padding: 8px 18px;
+                padding: 12px 18px;
                 border: none;
             }}
             QListWidget::item:selected {{
@@ -915,6 +953,23 @@ class SettingsDialog(QDialog):
             QPushButton#SettingsLinkButton:hover {{
                 background-color: rgba(255,255,255,0.14);
             }}
+            QCheckBox#PreferenceToggle {{
+                spacing: 0px;
+            }}
+            QCheckBox#PreferenceToggle::indicator {{
+                width: 18px;
+                height: 18px;
+                border-radius: 5px;
+                border: 1px solid rgba(255,255,255,0.25);
+                background-color: rgba(255,255,255,0.04);
+            }}
+            QCheckBox#PreferenceToggle::indicator:hover {{
+                border: 1px solid rgba(255,255,255,0.4);
+            }}
+            QCheckBox#PreferenceToggle::indicator:checked {{
+                background-color: {self._ACCENT};
+                border: 1px solid {self._ACCENT};
+            }}
         """)
 
         outer_layout = QVBoxLayout(self)
@@ -927,24 +982,49 @@ class SettingsDialog(QDialog):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # Only "About" exists right now - a real single-item list rather
-        # than a set of disabled placeholder entries for sections that
-        # don't exist yet, which would just be promising features that
-        # aren't there.
+        # Preferences first - it's the actionable page (toggles that
+        # actually change something), About is just static/informational,
+        # so it makes sense as the second stop rather than the default
+        # landing page.
         sidebar = QListWidget(self)
         sidebar.setFixedWidth(150)
         sidebar.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        sidebar.setSpacing(3)
+        sidebar.addItem("Preferences")
         sidebar.addItem("About")
         sidebar.setCurrentRow(0)
         layout.addWidget(sidebar)
 
-        content = QWidget(self)
-        content_layout = QVBoxLayout(content)
-        content_layout.setContentsMargins(24, 20, 24, 20)
-        content_layout.addWidget(self._build_about_page(app_icon_pixmap))
-        layout.addWidget(content, stretch=1)
+        self._content_stack = QStackedWidget(self)
+        self._content_stack.addWidget(self._wrap_settings_page(self._build_preferences_page()))
+        self._content_stack.addWidget(self._wrap_settings_page(self._build_about_page(app_icon_pixmap)))
+        sidebar.currentRowChanged.connect(self._content_stack.setCurrentIndex)
+        layout.addWidget(self._content_stack, stretch=1)
 
         outer_layout.addWidget(body, stretch=1)
+
+        # Frameless windows (FramelessWindowHint above) aren't reliably
+        # auto-centered over their parent by every window manager the way
+        # a normally-decorated dialog would be - left uncentered, this
+        # could end up positioned off to one side, with the main window
+        # visible/overlapping around it instead of properly behind a
+        # centered dialog. Centering explicitly here doesn't depend on
+        # any particular window manager's own placement behavior.
+        if parent is not None:
+            parent_geo = parent.frameGeometry()
+            x = parent_geo.x() + (parent_geo.width() - self.width()) // 2
+            y = parent_geo.y() + (parent_geo.height() - self.height()) // 2
+            self.move(max(0, x), max(0, y))
+
+    def _wrap_settings_page(self, page: QWidget) -> QWidget:
+        # Shared margins for every sidebar page, so each _build_*_page()
+        # method only has to build its own content, not repeat the same
+        # QVBoxLayout/margins boilerplate.
+        wrapper = QWidget(self)
+        wrapper_layout = QVBoxLayout(wrapper)
+        wrapper_layout.setContentsMargins(24, 20, 24, 20)
+        wrapper_layout.addWidget(page)
+        return wrapper
 
     def _build_title_bar(self) -> QWidget:
         bar = _DialogTitleBar(self)
@@ -972,6 +1052,63 @@ class SettingsDialog(QDialog):
         bar_layout.addWidget(close_btn)
 
         return bar
+
+    def _build_preferences_page(self) -> QWidget:
+        page = QWidget(self)
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        page_layout.setSpacing(14)
+
+        heading = QLabel("Preferences", page)
+        heading.setStyleSheet("font-size: 15px; font-weight: 800; color: rgba(255,255,255,0.95);")
+        page_layout.addWidget(heading)
+
+        card, card_layout = self._build_card_container()
+
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        text_col = QVBoxLayout()
+        text_col.setSpacing(2)
+        title_lbl = QLabel("Fan-favorite flame badge", card)
+        title_lbl.setStyleSheet("font-size: 13px; font-weight: 700; background: transparent; border: none;")
+        desc_lbl = QLabel(
+            "Shows a \U0001F525 next to whichever album is each artist's most-listened-to "
+            "on Last.fm, in the Artist view.", card
+        )
+        desc_lbl.setWordWrap(True)
+        desc_lbl.setStyleSheet("font-size: 11px; color: rgba(255,255,255,0.5); background: transparent; border: none;")
+        text_col.addWidget(title_lbl)
+        text_col.addWidget(desc_lbl)
+        row.addLayout(text_col, stretch=1)
+
+        # Reads/writes the main window's own persisted preference
+        # directly (self.parent() - SettingsDialog is always opened with
+        # the main window as its parent, see open_settings_dialog) rather
+        # than duplicating a second QSettings-backed copy of the same
+        # flag here.
+        main_window = self.parent()
+        checkbox = QCheckBox(card)
+        checkbox.setObjectName("PreferenceToggle")
+        checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
+        checkbox.setChecked(bool(main_window and main_window.show_trending_badge))
+        checkbox.toggled.connect(self._on_trending_badge_toggled)
+        row.addWidget(checkbox, alignment=Qt.AlignmentFlag.AlignTop)
+
+        card_layout.addLayout(row)
+        page_layout.addWidget(card)
+        page_layout.addStretch(1)
+
+        return page
+
+    def _on_trending_badge_toggled(self, checked: bool):
+        main_window = self.parent()
+        if main_window is None:
+            return
+        main_window.show_trending_badge = checked
+        main_window.settings.setValue("show_trending_badge", "true" if checked else "false")
+        # The Artist view itself only actually picks this up once the
+        # dialog closes (see open_settings_dialog) - this dialog is
+        # modal, so nothing behind it is visible to update live anyway.
 
     def _build_about_page(self, app_icon_pixmap: Optional[QPixmap]) -> QWidget:
         page = QWidget(self)
@@ -1761,6 +1898,16 @@ class FadingStackedWidget(QStackedWidget):
         
         old_widget = self.widget(self._old_idx)
         if old_widget:
+            # Whatever just triggered this switch may have changed this
+            # page's own content moments earlier (rebuilding a grid,
+            # clearing a filter, etc.) without Qt necessarily having
+            # re-laid it out yet - that recalculation can be deferred to
+            # the next paint cycle. Forcing it now, before the fade-out
+            # starts compositing this page, avoids capturing it mid-
+            # transition between its old and new content (which looked
+            # like leftover/ghosted content bleeding through the fade).
+            if old_widget.layout() is not None:
+                old_widget.layout().activate()
             self.current_eff = QGraphicsOpacityEffect(old_widget)
             old_widget.setGraphicsEffect(self.current_eff)
             self.anim_current = QPropertyAnimation(self.current_eff, b"opacity")
@@ -1784,6 +1931,12 @@ class FadingStackedWidget(QStackedWidget):
             # Force it into the right spot up front so even the first time
             # looks correct.
             new_widget.setGeometry(self.rect())
+            # Same reasoning as old_widget above - this page's content may
+            # have just been updated too (see e.g. handle_artist_card_clicked/
+            # close_artist_detail_view), so make sure its layout has
+            # actually caught up before it starts fading in.
+            if new_widget.layout() is not None:
+                new_widget.layout().activate()
 
             self.next_eff = QGraphicsOpacityEffect(new_widget)
             new_widget.setGraphicsEffect(self.next_eff)
@@ -1926,7 +2079,47 @@ class AlbumCardWidget(QWidget):
             self.artist_lbl = self._make_artist_label(artist, subtitle_style, text_viewport_width, artist_font)
             layout.addWidget(self.artist_lbl, alignment=Qt.AlignmentFlag.AlignHCenter)
 
+        # Small "fan favorite" flame indicator, shown just below the
+        # artist name - a normal layout-managed row Qt positions reliably
+        # on its own, not an absolutely-positioned overlay on the cover
+        # art. An overlay badge took several attempts to land correctly
+        # and still didn't end up where it was actually wanted - turns
+        # out the intent was "below the text entirely", not "on the
+        # artwork" at all, which a real layout row sidesteps needing to
+        # guess at pixel coordinates for entirely. Hidden by default and
+        # takes no space unless a card actually turns out to be trending
+        # (see set_trending) - only ever true for the artist detail
+        # view's fan-favorite-album lookup (see
+        # filter_library_by_artist), nowhere else.
+        self._trending_badge = QLabel("\U0001F525", self)
+        self._trending_badge.setObjectName("TrendingBadge")
+        self._trending_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        trending_font = QFont("SF Pro Text")
+        trending_badge_px = max(16, round(20 * scale))
+        trending_font.setPixelSize(trending_badge_px)
+        self._trending_badge.setFont(trending_font)
+        self._trending_badge.setContentsMargins(0, 0, 0, 0)
+        # Emoji glyphs carry a lot of extra vertical whitespace above/
+        # below the visible character at their font's natural line
+        # height - capping the label's own height tightly to the pixel
+        # size (rather than letting it size to the font's full line
+        # height) is what keeps the gap to the artist name above it
+        # looking intentional instead of oversized.
+        self._trending_badge.setFixedHeight(round(trending_badge_px * 1.05))
+        self._trending_badge.setVisible(False)
+        layout.addWidget(self._trending_badge, alignment=Qt.AlignmentFlag.AlignRight)
+
         layout.addStretch(1)
+
+        # Forces the layout to actually compute real child positions right
+        # now, so cover_label.geometry() below reflects exactly where the
+        # cover will really render - not a stale/zero rect from before the
+        # layout's had a pass. The pin badge is positioned from this
+        # ground-truth geometry rather than a parallel manual
+        # recalculation of margin/cover_size, which is what let it drift
+        # out of sync with where the cover actually ended up.
+        layout.activate()
+        cover_rect = self.cover_label.geometry()
 
         # A real child widget, not something drawn in paintEvent() - cover_label
         # above is also a child widget occupying this exact corner, and
@@ -1943,7 +2136,7 @@ class AlbumCardWidget(QWidget):
             f"background-color: rgba(0, 0, 0, 150); color: #FFD166; "
             f"border-radius: {badge_size // 2}px; font-size: {max(8, round(11 * scale))}pt;"
         )
-        self._pin_badge.move(self.width() - badge_size - 6, 5)
+        self._pin_badge.move(cover_rect.right() - badge_size - 3, cover_rect.top() + 3)
         self._pin_badge.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self._pin_badge.setVisible(False)
         self._pin_badge.raise_()
@@ -2068,6 +2261,9 @@ class AlbumCardWidget(QWidget):
     def set_pinned(self, pinned: bool):
         self._pinned = pinned
         self._pin_badge.setVisible(pinned)
+
+    def set_trending(self, trending: bool):
+        self._trending_badge.setVisible(trending)
 
     def set_now_playing(self, is_playing: bool):
         if self._now_playing == is_playing:
@@ -3025,8 +3221,35 @@ class AdaptiveMusicPlayer(QMainWindow):
         self.resume_save_timer.timeout.connect(self._save_resume_state)
 
         # --- State ---------------------------------------------------------
+        # Whether the Home shelves (Jump Back In, Made For You, Recently
+        # Played/Added, Most Played, Favorites) need recomputing before
+        # they're next shown - refresh_home_shelves() is genuinely
+        # expensive (8 separate mix rebuilds, several play-history scans,
+        # regenerating cover art), so it's wasteful to redo all of that
+        # every single time the Home tab is merely switched to, when
+        # nothing about the underlying data has actually changed since
+        # the last time it ran. Starts True so the very first real
+        # computation still happens on startup/first scan. See
+        # mark_home_shelves_dirty().
+        self.home_shelves_dirty = True
         # Combined repeat/shuffle button state: 0=off, 1=repeat playlist, 2=repeat song, 3=shuffle
         self.playback_mode = 0
+        # Shuffle (playback_mode == 3) walks this precomputed order of
+        # indices into active_playing_tracks, instead of play_next() just
+        # picking an independent random index every single call - that
+        # older approach had no fixed order for anything to preview ahead
+        # of time (a "next 5 shuffled tracks" list can't show what hasn't
+        # been decided yet), and could replay a track shortly after it
+        # just finished. shuffle_position is where "now" sits within
+        # shuffle_order; _shuffle_order_for_tracks records which
+        # active_playing_tracks list (by identity, not content - a new
+        # context always gets a fresh list object) this order was built
+        # for, so a real context change is detected and reshuffled for,
+        # while simply replaying the same list doesn't reshuffle for no
+        # reason. See _ensure_shuffle_order()/_regenerate_shuffle_order().
+        self.shuffle_order: list[int] = []
+        self.shuffle_position: int = -1
+        self._shuffle_order_for_tracks: Optional[list] = None
         self.user_is_dragging_slider = False
         self.music_folder = ""
         
@@ -3055,6 +3278,11 @@ class AdaptiveMusicPlayer(QMainWindow):
         # (False) - see _toggle_artist_top_songs_play_mode. Persisted so
         # it's remembered across launches.
         self.artist_top_songs_play_as_mix = self.settings.value("artist_top_songs_play_as_mix", "true") == "true"
+        # Whether the Artist view's flame badge (fan-favorite album, per
+        # Last.fm - see _apply_fan_favorite_badge) shows at all -
+        # toggleable in Settings > Preferences. Defaults on; persisted so
+        # a "no thanks" choice is remembered across launches.
+        self.show_trending_badge = self.settings.value("show_trending_badge", "true") == "true"
         # normalize_track_title(title) -> (album_key, track_path) for the
         # artist currently showing in the detail panel - rebuilt fresh
         # each time by filter_library_by_artist(); see
@@ -3106,13 +3334,17 @@ class AdaptiveMusicPlayer(QMainWindow):
         # into the queue (i.e. most of the time).
         self._queue_return_context: Optional[tuple] = None
         # Cache for the "now playing" outline - which cards currently have
-        # it (self._now_playing_card_widgets) and which album key that
-        # cache reflects (self._now_playing_outline_key), so
-        # _refresh_now_playing_outlines() can skip its full grid walk
-        # whenever the playing album hasn't actually changed. See that
-        # method for why this matters.
+        # it (self._now_playing_card_widgets) and which (album key, track
+        # path) pair that cache reflects, so _refresh_now_playing_outlines()
+        # can skip its full grid walk whenever neither has actually
+        # changed. The track path half matters for "track" mode cards
+        # (e.g. a Jump Back In single) - the album key alone doesn't
+        # change as playback moves on to the next song in the same
+        # album, but a track card's own ring still needs to turn off at
+        # that point since it's no longer the specific thing playing.
         self._now_playing_card_widgets: list[AlbumCardWidget] = []
         self._now_playing_outline_key: Optional[str] = None
+        self._now_playing_outline_track_path: Optional[str] = None
         self.current_track_index = -1
         self.track_titles: dict[str, str] = {}
         
@@ -3568,6 +3800,18 @@ class AdaptiveMusicPlayer(QMainWindow):
         self.nav_tab_bar.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, not visible)
 
     def switch_top_level_tab(self, index: int):
+        # Clicking Library while "inside" the artist-detail trick
+        # (active_top_level_tab pretending to be TAB_ARTISTS while
+        # view_stack is actually already sitting on TAB_LIBRARY, filtered
+        # down to one artist - see handle_artist_card_clicked) needs to
+        # reset back to a normal, unfiltered grid - but since view_stack's
+        # own index isn't literally changing in that case, its "already on
+        # this page, do nothing" guard would otherwise make clicking
+        # Library here silently do nothing at all instead of resetting.
+        if (index == self.TAB_LIBRARY and self.artist_filter_name is not None
+                and self.view_stack.currentIndex() == self.TAB_LIBRARY):
+            self.clear_artist_filter()
+
         self.active_top_level_tab = index
         self.view_stack.setCurrentIndex(index)
         self._refresh_nav_tab_buttons()
@@ -3582,6 +3826,23 @@ class AdaptiveMusicPlayer(QMainWindow):
         # bounded number of times on its own if the page's real width
         # isn't knowable yet, rather than depending on some later,
         # unrelated event like a tab switch to ever correct it.
+
+    def switch_top_level_tab_instant(self, index: int):
+        # Bypasses FadingStackedWidget's crossfade entirely (by calling the
+        # plain QStackedWidget implementation it overrides, directly)
+        # rather than animating - kept as a general-purpose option for any
+        # future case that genuinely needs an instant page switch, even
+        # though the artist-detail "Back" button that originally motivated
+        # this ended up not needing it after all (see close_artist_detail_view -
+        # the real fix there was not rebuilding Library's grid immediately
+        # before the switch, not avoiding the crossfade itself).
+        self.active_top_level_tab = index
+        QStackedWidget.setCurrentIndex(self.view_stack, index)
+        self._refresh_nav_tab_buttons()
+        if index == self.TAB_HOME:
+            self.refresh_home_shelves()
+        elif index == self.TAB_PLAYLISTS:
+            self.rebuild_playlist_grid()
 
     def _refresh_nav_tab_buttons(self):
         for index, btn in self.tab_buttons.items():
@@ -4259,9 +4520,12 @@ class AdaptiveMusicPlayer(QMainWindow):
             return self.generate_mix_cover_pixmap(style=meta.get("mix_style", "replay"), size=home_cover_size)
         return meta.get("pixmap")
 
-    def refresh_home_shelves(self):
+    def refresh_home_shelves(self, force: bool = False):
         if not hasattr(self, "home_shelves"):
             return
+        if not force and not self.home_shelves_dirty:
+            return  # nothing's changed since these were last computed
+        self.home_shelves_dirty = False
 
         if hasattr(self, "home_scroll_content"):
             self.home_scroll_content.update_margins()
@@ -4369,6 +4633,25 @@ class AdaptiveMusicPlayer(QMainWindow):
 
         self.home_empty_label.setVisible(not any_visible)
         self._refresh_now_playing_outlines(force=True)
+
+    def mark_home_shelves_dirty(self):
+        # Called from anywhere that genuinely changes what the Home
+        # shelves should show (a play got logged, an album got pinned/
+        # unpinned) - rather than eagerly recomputing everything right
+        # then and there regardless of whether anyone's even looking at
+        # Home, this just flags it as stale. refresh_home_shelves() picks
+        # that up and does the real work next time it's actually shown
+        # (see switch_top_level_tab), which is the common case (the
+        # change happened while browsing Library/Artists/Playlists, not
+        # Home).
+        #
+        # The one exception: if Home is what's on screen right this
+        # moment, the shelves need to visibly update live, not silently
+        # go stale until the person happens to leave and come back - so
+        # this refreshes immediately for that specific case only.
+        self.home_shelves_dirty = True
+        if self.active_top_level_tab == self.TAB_HOME and self.view_stack.currentIndex() == self.TAB_HOME:
+            self.refresh_home_shelves()
 
     def _build_artists_view(self) -> QWidget:
         page = QWidget()
@@ -4738,7 +5021,19 @@ class AdaptiveMusicPlayer(QMainWindow):
 
     def handle_artist_card_clicked(self, artist_name: str):
         self.filter_library_by_artist(artist_name)
-        self.switch_top_level_tab(self.TAB_LIBRARY)
+        # This reuses the exact same "Library filtered down to one
+        # artist" page/grid that Library's own artist-name clicks already
+        # show, rather than building an entirely separate page with an
+        # identical photo/bio/album-grid/Top Songs layout - it's just
+        # presented as its own dedicated Artists-tab destination instead
+        # of a detour through Library. Artists stays the highlighted tab
+        # (active_top_level_tab), independent of which page is actually
+        # on screen (view_stack) - see close_artist_detail_view() for the
+        # way back out, which returns to the real Artists grid rather
+        # than an unfiltered Library.
+        self.active_top_level_tab = self.TAB_ARTISTS
+        self.view_stack.setCurrentIndex(self.TAB_LIBRARY)
+        self._refresh_nav_tab_buttons()
 
     def filter_library_by_artist(self, artist_name: str):
         # Same album grid Library normally shows, just restricted to one
@@ -4801,10 +5096,19 @@ class AdaptiveMusicPlayer(QMainWindow):
                 artist_name, cached_info.get("bio", ""), cached_info.get("listeners", ""), cached_info.get("playcount", "")
             )
             self._render_artist_top_songs(cached_info.get("top_tracks", []))
-        stats_stale, bio_stale, top_tracks_needed = self._artist_info_staleness(cached_info)
-        if stats_stale or bio_stale or top_tracks_needed:
+            # The flame badge - whichever album is this artist's fan
+            # favorite on Last.fm (see _resolve_fan_favorite_album_key),
+            # not anything about this person's own local listening.
+            # Already-cached candidates get applied immediately; a fresh
+            # fetch (see the staleness check below) will re-apply once it
+            # lands if this cache is stale or missing.
+            if "top_album_candidates" in cached_info:
+                self._apply_fan_favorite_badge(artist_name, cached_info["top_album_candidates"])
+        stats_stale, bio_stale, top_tracks_needed, top_albums_needed = self._artist_info_staleness(cached_info)
+        if stats_stale or bio_stale or top_tracks_needed or top_albums_needed:
             self._kick_off_artist_info_fetch(
-                artist_name, update_stats=stats_stale, update_bio=bio_stale, fetch_top_tracks=top_tracks_needed
+                artist_name, update_stats=stats_stale, update_bio=bio_stale,
+                fetch_top_tracks=top_tracks_needed, fetch_top_albums=top_albums_needed,
             )
 
         self.artist_filter_banner.setVisible(True)
@@ -4812,6 +5116,21 @@ class AdaptiveMusicPlayer(QMainWindow):
     def clear_artist_filter(self):
         self.artist_filter_name = None
         self.rebuild_album_grid()
+
+    def close_artist_detail_view(self):
+        # The "Back" button on the artist-detail banner - returns to the
+        # real Artists tab/grid via the exact same path clicking the
+        # Artists nav tab itself already uses (plain switch_top_level_tab,
+        # normal crossfade). Deliberately does NOT clear the artist filter
+        # here - doing that immediately before the switch (rebuilding
+        # Library's whole album grid right as the crossfade starts
+        # capturing a render of it) was what actually caused the visible
+        # ghosting/bleed-through, not the crossfade or page complexity in
+        # general. The filter clears itself lazily instead, the next time
+        # Library is genuinely revisited (see switch_top_level_tab) -
+        # harmless to leave as-is meanwhile since nothing is looking at
+        # the Library page while we're over on Artists.
+        self.switch_top_level_tab(self.TAB_ARTISTS)
 
     # -------------------------------------------------------- Artist photos --
     def _artist_image_cache_dir(self) -> str:
@@ -4878,29 +5197,32 @@ class AdaptiveMusicPlayer(QMainWindow):
             pass  # non-fatal - worst case this artist's bio/stats just get re-fetched next time
 
     def _artist_info_staleness(self, cached_info: Optional[dict]) -> tuple:
-        # (stats_stale, bio_stale, top_tracks_needed) - the first two are
-        # independent time-based checks, since stats and bio are allowed
-        # to go stale at different rates (see
+        # (stats_stale, bio_stale, top_tracks_needed, top_albums_needed) -
+        # the first two are independent time-based checks, since stats and
+        # bio are allowed to go stale at different rates (see
         # ARTIST_STATS_MAX_AGE_SECONDS/ARTIST_BIO_MAX_AGE_SECONDS). No
         # cache at all counts as everything being needed - there's nothing
         # yet to even consider fresh.
         #
-        # top_tracks_needed isn't purely time-based like the other two -
-        # it's also true whenever the cache simply has no "top_tracks" key
-        # at all yet, regardless of how fresh stats otherwise are. Without
-        # that, an artist whose stats were already cached before Top Songs
-        # existed would just never get one fetched for it until the next
-        # time stats happen to go stale on their own, which could be up to
-        # a full day away.
+        # top_tracks_needed/top_albums_needed aren't purely time-based
+        # like the other two - each is also true whenever the cache
+        # simply doesn't have that key at all yet, regardless of how
+        # fresh stats otherwise are. Without that, an artist whose stats
+        # were already cached before Top Songs/the flame badge existed
+        # would just never get either fetched for it until the next time
+        # stats happen to go stale on their own, which could be up to a
+        # full day away.
         if not cached_info:
-            return True, True, True
+            return True, True, True, True
         now = time.time()
         stats_stale = (now - cached_info.get("stats_updated_at", 0)) > ARTIST_STATS_MAX_AGE_SECONDS
         bio_stale = (now - cached_info.get("bio_updated_at", 0)) > ARTIST_BIO_MAX_AGE_SECONDS
         top_tracks_needed = stats_stale or "top_tracks" not in cached_info
-        return stats_stale, bio_stale, top_tracks_needed
+        top_albums_needed = stats_stale or "top_album_candidates" not in cached_info
+        return stats_stale, bio_stale, top_tracks_needed, top_albums_needed
 
-    def _kick_off_artist_info_fetch(self, artist_name: str, update_stats: bool, update_bio: bool, fetch_top_tracks: bool):
+    def _kick_off_artist_info_fetch(self, artist_name: str, update_stats: bool, update_bio: bool,
+                                     fetch_top_tracks: bool, fetch_top_albums: bool = False):
         if self._artist_info_fetcher is not None:
             old_fetcher = self._artist_info_fetcher
             # Same keep-alive-until-actually-finished handling
@@ -4911,7 +5233,7 @@ class AdaptiveMusicPlayer(QMainWindow):
             self._retiring_artist_info_fetchers.append(old_fetcher)
             old_fetcher.finished.connect(lambda f=old_fetcher: self._retiring_artist_info_fetchers.remove(f))
             self._artist_info_fetcher = None
-        fetcher = ArtistInfoFetcher(artist_name, fetch_top_tracks=fetch_top_tracks)
+        fetcher = ArtistInfoFetcher(artist_name, fetch_top_tracks=fetch_top_tracks, fetch_top_albums=fetch_top_albums)
         # update_stats/update_bio say which half of the cache this
         # particular request is actually allowed to overwrite once it
         # comes back - captured here rather than threaded through the
@@ -4923,6 +5245,7 @@ class AdaptiveMusicPlayer(QMainWindow):
                 self._on_artist_info_fetched(name, bio, listeners, playcount, us, ub)
         )
         fetcher.top_tracks_fetched.connect(self._on_artist_top_tracks_fetched)
+        fetcher.top_albums_fetched.connect(self._on_artist_top_albums_fetched)
         fetcher.finished.connect(self._on_artist_info_fetch_finished)
         self._artist_info_fetcher = fetcher
         fetcher.start()
@@ -4958,8 +5281,62 @@ class AdaptiveMusicPlayer(QMainWindow):
         if self.artist_filter_name == artist_name:
             self._render_artist_top_songs(tracks)
 
+    def _on_artist_top_albums_fetched(self, artist_name: str, album_names: list):
+        info = self._load_cached_artist_info(artist_name) or {}
+        info["top_album_candidates"] = album_names
+        self._save_cached_artist_info(artist_name, info)
+        if self.artist_filter_name == artist_name:
+            self._apply_fan_favorite_badge(artist_name, album_names)
+
     def _on_artist_info_fetch_finished(self):
         self._artist_info_fetcher = None
+
+    def _resolve_fan_favorite_album_key(self, artist_name: str, candidate_names: list) -> Optional[str]:
+        # Last.fm's top-albums ranking (candidate_names, highest-listened
+        # first) matched against what this artist's albums are actually
+        # called in the local library - the two rarely agree on
+        # punctuation/casing exactly, so this compares normalized forms
+        # the same way Last.fm top-track titles get matched against local
+        # tracks (see normalize_track_title). Returns the highest-ranked
+        # candidate that's actually owned locally, skipping over anything
+        # further down the list that isn't (e.g. a "Greatest Hits"
+        # compilation ranked #1 on Last.fm that this library doesn't
+        # have) - None if nothing in the whole ranked list matches
+        # anything local.
+        norm_artist = artist_name.lower()
+        local_albums_by_normalized_title = {}
+        for key in self.sorted_album_keys:
+            meta = self.album_display_meta.get(key)
+            if not meta or primary_artist_name(meta["artist"]).lower() != norm_artist:
+                continue
+            normalized = normalize_track_title(meta["title"])
+            if normalized:
+                local_albums_by_normalized_title[normalized] = key
+        for candidate in candidate_names:
+            normalized = normalize_track_title(candidate)
+            if normalized in local_albums_by_normalized_title:
+                return local_albums_by_normalized_title[normalized]
+        return None
+
+    def _apply_fan_favorite_badge(self, artist_name: str, candidate_names: list):
+        # Turns the flame badge on for whichever currently-displayed
+        # album card matches the resolved fan-favorite album, and off for
+        # every other card - the grid itself may hold cards for more than
+        # this one artist's albums in principle, so this only ever acts
+        # on ones actually belonging to artist_name. Also doubles as the
+        # "make sure every badge is off" path when the Settings toggle is
+        # disabled (see open_settings_dialog) - forcing favorite_key to
+        # None here means every card below ends up with is_favorite=False,
+        # the same as if nothing had matched.
+        favorite_key = self._resolve_fan_favorite_album_key(artist_name, candidate_names) if self.show_trending_badge else None
+        for i in range(self.album_grid.count()):
+            widget = self.album_grid.itemWidget(self.album_grid.item(i))
+            if not isinstance(widget, AlbumCardWidget) or widget.mode != "album":
+                continue
+            is_favorite = favorite_key is not None and widget.album_key == favorite_key
+            widget.set_trending(is_favorite)
+            if is_favorite:
+                widget.setToolTip("Fans' favorite album (Last.fm)")
 
     def _apply_artist_info(self, artist_name: str, bio: str, listeners: str, playcount: str):
         self.artist_detail_listeners_label.setText(
@@ -5257,14 +5634,14 @@ class AdaptiveMusicPlayer(QMainWindow):
         detail_name_row = QHBoxLayout()
         self.artist_filter_label = QLabel("", self)
         self.artist_filter_label.setObjectName("ArtistDetailName")
-        artist_filter_clear_btn = QPushButton("\u2715 Clear", self)
-        artist_filter_clear_btn.setObjectName("ArtistFilterClearButton")
-        artist_filter_clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        artist_filter_clear_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        artist_filter_clear_btn.clicked.connect(self.clear_artist_filter)
+        artist_filter_back_btn = QPushButton("\u2190 Back", self)
+        artist_filter_back_btn.setObjectName("ArtistFilterClearButton")
+        artist_filter_back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        artist_filter_back_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        artist_filter_back_btn.clicked.connect(self.close_artist_detail_view)
         detail_name_row.addWidget(self.artist_filter_label)
         detail_name_row.addStretch(1)
-        detail_name_row.addWidget(artist_filter_clear_btn, alignment=Qt.AlignmentFlag.AlignTop)
+        detail_name_row.addWidget(artist_filter_back_btn, alignment=Qt.AlignmentFlag.AlignTop)
         detail_info_col.addLayout(detail_name_row)
 
         # Public listener/scrobble counts from Last.fm - same kind of
@@ -5639,17 +6016,6 @@ class AdaptiveMusicPlayer(QMainWindow):
         now_playing_text_col.addWidget(self.queue_now_playing_subtitle)
         now_playing_row.addLayout(now_playing_text_col, stretch=1)
 
-        # A subtle fade animates in whenever the displayed track actually
-        # changes (see _animate_queue_now_playing_change(), triggered from
-        # _refresh_queue_panel() only when the track identity differs from
-        # last time) - a plain instant text/art swap read as an abrupt
-        # jump-cut every time playback advanced while this view was open.
-        self._queue_now_playing_opacity_effect = QGraphicsOpacityEffect(now_playing_card)
-        self._queue_now_playing_opacity_effect.setOpacity(1.0)
-        now_playing_card.setGraphicsEffect(self._queue_now_playing_opacity_effect)
-        self._queue_now_playing_fade_anim: Optional[QPropertyAnimation] = None
-        self._queue_now_playing_last_path: Optional[str] = None
-
         layout.addWidget(now_playing_card)
 
         # --- "Next in Queue" - the manual queue, reorderable ---------------
@@ -5665,7 +6031,7 @@ class AdaptiveMusicPlayer(QMainWindow):
             "Nothing manually queued. Right-click any track or album and "
             "choose \u201cPlay Next\u201d or \u201cAdd to Queue\u201d.", page
         )
-        self.queue_empty_label.setStyleSheet("font-size: 12px; color: rgba(255,255,255,0.45);")
+        self.queue_empty_label.setStyleSheet("font-size: 12px; color: rgba(255,255,255,0.45); padding-left: 2px;")
         self.queue_empty_label.setWordWrap(True)
         self.queue_empty_label.setVisible(False)
         layout.addWidget(self.queue_empty_label)
@@ -5710,6 +6076,20 @@ class AdaptiveMusicPlayer(QMainWindow):
         self.queue_context_list_widget.customContextMenuRequested.connect(self._show_queue_context_preview_menu)
         self.queue_context_list_widget.setVisible(False)
         layout.addWidget(self.queue_context_list_widget, stretch=1)
+
+        # Takes the list's place (same slot, right below the same always-
+        # visible heading) when there's genuinely nothing left to preview -
+        # e.g. the last track of an album with repeat/shuffle both off.
+        # Previously the whole section (heading and list both) just
+        # vanished at that point, which meant everything below the Now
+        # Playing card visibly shifted position the moment the second-to-
+        # last track finished - jarring for something that's just normal
+        # playback progressing, not a real layout change.
+        self.queue_context_empty_label = QLabel("That's the last track \u2014 nothing queued up after this.", page)
+        self.queue_context_empty_label.setStyleSheet("font-size: 12px; color: rgba(255,255,255,0.45); padding-left: 2px;")
+        self.queue_context_empty_label.setWordWrap(True)
+        self.queue_context_empty_label.setVisible(False)
+        layout.addWidget(self.queue_context_empty_label, stretch=1)
 
         # Shown instead of everything above when nothing's loaded at all.
         self.queue_nothing_playing_label = QLabel(
@@ -5975,6 +6355,9 @@ class AdaptiveMusicPlayer(QMainWindow):
             }}
             QLabel#ArtistDetailBio {{
                 font-weight: 400; font-size: 12px; color: rgba(255,255,255,0.6);
+            }}
+            QLabel#TrendingBadge {{
+                background: transparent;
             }}
             QPushButton#ArtistFilterClearButton {{
                 background-color: rgba(255, 255, 255, 0.06);
@@ -6661,7 +7044,7 @@ class AdaptiveMusicPlayer(QMainWindow):
                 self._start_playing_browsed_album()
                 self.play_track_at(resume_row, autoplay=False, resume_position_ms=resume_position_ms)
 
-        self.refresh_home_shelves()
+        self.refresh_home_shelves(force=True)
         self.refresh_artist_grid()
         self.rebuild_playlist_grid()
 
@@ -6819,7 +7202,7 @@ class AdaptiveMusicPlayer(QMainWindow):
         # search mode.
         if self.grid_mode == "album":
             self.rebuild_album_grid()
-        self.refresh_home_shelves()
+        self.mark_home_shelves_dirty()
 
     # ------------------------------------------------------- Search Engine --
     def filter_library(self, text: str):
@@ -6888,8 +7271,8 @@ class AdaptiveMusicPlayer(QMainWindow):
 
     def _refresh_now_playing_outlines(self, force: bool = False):
         # A full walk of every grid (Library alone can mean the whole
-        # library) only actually needs to happen when the playing album
-        # has changed since last time, or right after a grid holding
+        # library) only actually needs to happen when the playing album or
+        # track has changed since last time, or right after a grid holding
         # cards gets rebuilt from scratch (force=True, used by the
         # rebuild_*/refresh_home_shelves methods below, since that's the
         # only time old widget references can go stale). Skipping it
@@ -6898,9 +7281,16 @@ class AdaptiveMusicPlayer(QMainWindow):
         # track from the same album, by far the most common case during
         # normal playback - which is what made rapid/repeated clicks
         # visibly stutter.
-        if not force and self._now_playing_outline_key == self.active_playing_album_key:
+        current_track_path = None
+        if 0 <= self.current_track_index < len(self.active_playing_tracks):
+            current_track_path = self.active_playing_tracks[self.current_track_index]
+
+        if (not force
+                and self._now_playing_outline_key == self.active_playing_album_key
+                and self._now_playing_outline_track_path == current_track_path):
             return
         self._now_playing_outline_key = self.active_playing_album_key
+        self._now_playing_outline_track_path = current_track_path
 
         for card in self._now_playing_card_widgets:
             try:
@@ -6910,14 +7300,22 @@ class AdaptiveMusicPlayer(QMainWindow):
 
         matches = []
         if self.active_playing_album_key:
-            # Only "album"/"playlist" mode cards are eligible - a "track"
-            # mode card (a single song on a Home shelf or in search
-            # results) isn't itself playing just because the album it's
-            # from happens to be.
+            # "album"/"playlist" mode cards light up for as long as the
+            # album is playing at all, regardless of which of its tracks -
+            # a "track" mode card (a single song on a Home shelf or in
+            # search results) only lights up while that exact track is the
+            # one currently playing, not just because the album it's from
+            # happens to be (see current_track_path above).
             for grid in self._all_grids_with_cards():
                 for i in range(grid.count()):
                     widget = grid.itemWidget(grid.item(i))
-                    if isinstance(widget, AlbumCardWidget) and widget.mode in ("album", "playlist") and widget.album_key == self.active_playing_album_key:
+                    if not isinstance(widget, AlbumCardWidget):
+                        continue
+                    if widget.mode in ("album", "playlist") and widget.album_key == self.active_playing_album_key:
+                        widget.set_now_playing(True)
+                        widget.set_accent(self._current_accent)
+                        matches.append(widget)
+                    elif widget.mode == "track" and current_track_path is not None and widget.track_path == current_track_path:
                         widget.set_now_playing(True)
                         widget.set_accent(self._current_accent)
                         matches.append(widget)
@@ -6971,7 +7369,20 @@ class AdaptiveMusicPlayer(QMainWindow):
         self.pinned_grid.viewport().update()
 
     def handle_card_clicked(self, card: AlbumCardWidget):
-        self.set_selected_card(card)
+        if card.mode == "track":
+            # Deliberately not set_selected_card() here - a "selected"
+            # ring on a track card would just be a static "you clicked
+            # this once" marker with nothing to ever turn it back off
+            # again once playback moves on to the next track. Its ring
+            # comes entirely from _refresh_now_playing_outlines() instead
+            # (see play_track_at), which re-evaluates on every track
+            # change and only lights up while this exact track is the one
+            # actually playing - still clear any other card's stale
+            # selection ring though, for the same reason clicking
+            # anywhere else always does.
+            self._clear_card_selection()
+        else:
+            self.set_selected_card(card)
         if card.plays_immediately_on_click:
             # Home has no track-list panel of its own (that lives on the
             # Library page) - a single click here plays right away
@@ -7095,6 +7506,22 @@ class AdaptiveMusicPlayer(QMainWindow):
 
         self.current_track_index = row
         self._load_lyrics_for_track(path)
+        if self.playback_mode == 3 and self.active_playing_album_key != self.QUEUE_KEY:
+            # Keeps shuffle_order valid for whatever's actually playing
+            # now, without regenerating it on every single track (only a
+            # genuinely new context - see _ensure_shuffle_order - triggers
+            # a reshuffle here; normal shuffled advancement already
+            # updated shuffle_position itself back in play_next()).
+            self._ensure_shuffle_order()
+        # The authoritative refresh call for "now playing" card outlines -
+        # every path that starts a track (normal advance, a click, the
+        # queue, resuming a session) ends up here, so this is the one
+        # place guaranteed to see the final, correct current_track_index/
+        # active_playing_tracks state. Other call sites elsewhere (e.g.
+        # _start_playing_browsed_album) also call this before invoking
+        # play_track_at - that's harmless, just a premature pass using
+        # about-to-be-stale state that this call immediately supersedes.
+        self._refresh_now_playing_outlines()
 
         if self.browsing_album_key == self.active_playing_album_key:
             self.song_list_widget.set_now_playing_row(row, animate=autoplay)
@@ -7221,7 +7648,48 @@ class AdaptiveMusicPlayer(QMainWindow):
 
         return album_key, row, max(0, position_ms)
 
+    def _regenerate_shuffle_order(self):
+        # A fresh shuffled visiting order for the current
+        # active_playing_tracks - position 0 is always wherever's playing
+        # right now (so shuffle_position can start at 0 and "what's next"
+        # is simply shuffle_order[shuffle_position + 1:] from here on),
+        # everything else shuffled after it.
+        count = len(self.active_playing_tracks)
+        self._shuffle_order_for_tracks = self.active_playing_tracks
+        if count == 0:
+            self.shuffle_order = []
+            self.shuffle_position = -1
+            return
+        start = self.current_track_index if 0 <= self.current_track_index < count else 0
+        others = [i for i in range(count) if i != start]
+        random.shuffle(others)
+        self.shuffle_order = [start] + others
+        self.shuffle_position = 0
+
+    def _ensure_shuffle_order(self):
+        # Regenerates only if this is genuinely a different track list
+        # than shuffle_order was last built for - compared by identity,
+        # not equality/content, since every real context change (a new
+        # album, mix, or playlist starting) always assigns a brand new
+        # list object to active_playing_tracks, even on the rare occasion
+        # its contents would happen to match the previous one exactly.
+        if self._shuffle_order_for_tracks is not self.active_playing_tracks:
+            self._regenerate_shuffle_order()
+
     def play_previous(self):
+        if self.playback_mode == 3 and self.active_playing_album_key != self.QUEUE_KEY:
+            # Walks shuffle_order backwards, mirroring play_next()'s
+            # forward walk - using plain current_track_index - 1 here
+            # instead (the sequential-previous track, ignoring shuffle
+            # entirely) would leave shuffle_position pointing at
+            # wherever it was, desynced from where playback actually is,
+            # so the next "Next" press would jump somewhere unrelated to
+            # where "Previous" just went.
+            self._ensure_shuffle_order()
+            if self.shuffle_position > 0:
+                self.shuffle_position -= 1
+                self.play_track_at(self.shuffle_order[self.shuffle_position])
+            return
         if self.current_track_index > 0:
             self.play_track_at(self.current_track_index - 1)
 
@@ -7248,8 +7716,21 @@ class AdaptiveMusicPlayer(QMainWindow):
             self._refresh_now_playing_outlines()
 
         if self.playback_mode == 3 and len(self.active_playing_tracks) > 1:
-            candidates = [i for i in range(len(self.active_playing_tracks)) if i != self.current_track_index]
-            self.play_track_at(random.choice(candidates))
+            self._ensure_shuffle_order()
+            if self.shuffle_position + 1 < len(self.shuffle_order):
+                self.shuffle_position += 1
+                self.play_track_at(self.shuffle_order[self.shuffle_position])
+            else:
+                # Reached the end of this shuffled lap - reshuffle and
+                # keep going rather than just stopping, the same way
+                # shuffle has always kept playing indefinitely without
+                # needing repeat-playlist also turned on. Jumps straight
+                # to position 1 (skipping the fresh order's position 0,
+                # which is just a placeholder for the track that already
+                # finished) so this doesn't immediately replay it.
+                self._regenerate_shuffle_order()
+                self.shuffle_position = 1 if len(self.shuffle_order) > 1 else 0
+                self.play_track_at(self.shuffle_order[self.shuffle_position])
             return
 
         if self.current_track_index + 1 < len(self.active_playing_tracks):
@@ -7360,6 +7841,38 @@ class AdaptiveMusicPlayer(QMainWindow):
         tracks, _album_key, index = self._effective_playback_context()
         if not tracks or index < 0:
             return []
+
+        # Only meaningful for the actual live context, not the ephemeral
+        # single-track manual-queue detour (shuffle_order isn't tracked
+        # for that, and repeat-playlist wrapping the queue's own single
+        # "track list" back to itself wouldn't mean anything either) - a
+        # plain running-order preview is a reasonable fallback for that
+        # edge case.
+        is_live_context = self.active_playing_album_key != self.QUEUE_KEY
+
+        if self.playback_mode == 3 and is_live_context:
+            # Shuffle - walk the exact same precomputed order play_next()
+            # itself advances through (see _ensure_shuffle_order), so this
+            # always matches what will actually play next instead of
+            # showing the plain album order shuffle wouldn't follow.
+            self._ensure_shuffle_order()
+            upcoming_indices = self.shuffle_order[self.shuffle_position + 1:]
+            return [tracks[i] for i in upcoming_indices if 0 <= i < len(tracks)]
+
+        if self.playback_mode == 1 and is_live_context:
+            # Repeat playlist - once the plain remaining tracks run out,
+            # keep going by wrapping back around to the start, since
+            # that's genuinely what plays next rather than the preview
+            # just trailing off into empty space.
+            return tracks[index + 1:] + tracks[:index]
+
+        # Off, or repeat-single - repeat-single doesn't actually change
+        # the underlying album/playlist order, it just holds the current
+        # track in place, so it gets the same plain running-order preview
+        # "off" does rather than anything special (showing this one track
+        # forever, or nothing at all, would be more confusing than just
+        # leaving the preview as the normal, stable order it'll resume
+        # once repeat-single gets turned back off).
         return tracks[index + 1:]
 
     def _effective_playback_context_label(self) -> str:
@@ -7400,25 +7913,6 @@ class AdaptiveMusicPlayer(QMainWindow):
 
         painter.end()
         return target
-
-    def _animate_queue_now_playing_change(self):
-        # A quick dip-and-recover opacity flash on the Now Playing card,
-        # triggered only when the actually-displayed track changes (see
-        # the track_changed check in _refresh_queue_panel) - signals "this
-        # just updated" instead of the text/art silently swapping out from
-        # under you mid-glance.
-        if not hasattr(self, "_queue_now_playing_opacity_effect"):
-            return
-        if self._queue_now_playing_fade_anim is not None and self._queue_now_playing_fade_anim.state() == QPropertyAnimation.State.Running:
-            self._queue_now_playing_fade_anim.stop()
-        self._queue_now_playing_opacity_effect.setOpacity(0.35)
-        anim = QPropertyAnimation(self._queue_now_playing_opacity_effect, b"opacity", self)
-        anim.setDuration(280)
-        anim.setStartValue(0.35)
-        anim.setEndValue(1.0)
-        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        self._queue_now_playing_fade_anim = anim
-        anim.start()
 
     def _pulse_queue_rows(self, indices):
         # Flashes the just-added row(s) in "Next in Queue" - visual
@@ -7466,9 +7960,6 @@ class AdaptiveMusicPlayer(QMainWindow):
             return  # UI not built yet - called too early during init
 
         has_current_track = 0 <= self.current_track_index < len(self.active_playing_tracks)
-        current_path = self.active_playing_tracks[self.current_track_index] if has_current_track else None
-        track_changed = current_path != self._queue_now_playing_last_path
-        self._queue_now_playing_last_path = current_path
 
         # --- Now Playing card -----------------------------------------
         # Same plain "track title / artist" format as every row below it -
@@ -7484,9 +7975,6 @@ class AdaptiveMusicPlayer(QMainWindow):
         else:
             self.queue_now_playing_title.setText("Nothing playing")
             self.queue_now_playing_subtitle.setText("")
-
-        if track_changed:
-            self._animate_queue_now_playing_change()
 
         # --- "Next in Queue" (the manual queue, reorderable) -----------
         self.queue_list_widget.blockSignals(True)
@@ -7520,15 +8008,25 @@ class AdaptiveMusicPlayer(QMainWindow):
 
         has_upcoming = bool(upcoming)
         context_label = self._effective_playback_context_label()
+        has_context = bool(context_label)
         self.queue_context_heading.setText(f"Next from {context_label}" if context_label else "Next Up")
-        self.queue_context_heading.setVisible(has_upcoming)
-        self.queue_context_list_widget.setVisible(has_upcoming)
+        # The heading and one of {list, empty label} stay part of the
+        # same always-present structural slot whenever there's a real
+        # context to name, regardless of whether anything's actually left
+        # to preview right now - letting the whole section vanish
+        # whenever the list ran dry (e.g. the last track of an album)
+        # was what made everything below the Now Playing card visibly
+        # jump position on every ordinary "second-to-last -> last track"
+        # transition.
+        self.queue_context_heading.setVisible(has_context)
+        self.queue_context_list_widget.setVisible(has_context and has_upcoming)
+        self.queue_context_empty_label.setVisible(has_context and not has_upcoming)
 
         # --- Overall empty state -----------------------------------------
         # Only when there's truly nothing to show anywhere - something
         # loaded (even just paused, with nothing queued or upcoming) still
         # counts as "there's a Now Playing card to show".
-        self.queue_nothing_playing_label.setVisible(not has_current_track and not has_queue_items and not has_upcoming)
+        self.queue_nothing_playing_label.setVisible(not has_current_track and not has_queue_items and not has_context)
 
     def _on_queue_reordered(self, *args):
         # Drag-and-drop reordering inside queue_list_widget (InternalMove)
@@ -7572,12 +8070,52 @@ class AdaptiveMusicPlayer(QMainWindow):
         tracks, album_key, current_index = self._effective_playback_context()
         if not album_key or album_key == self.QUEUE_KEY:
             return  # nothing real to jump back into
-        target_index = current_index + 1 + row
-        if not (0 <= target_index < len(tracks)):
-            return
-        self.active_playing_tracks = list(tracks)
-        self.active_playing_album_key = album_key
-        self._queue_return_context = None  # we've now returned to this context directly
+
+        is_live_context = self.active_playing_album_key != self.QUEUE_KEY
+        target_shuffle_position = None
+
+        if self.playback_mode == 3 and is_live_context:
+            # The preview's rows came from shuffle_order (see
+            # _compute_upcoming_context_tracks), not a plain sequential
+            # offset from current_index - resolving "row" as if it were
+            # sequential here would jump to whatever track happens to
+            # sit that many slots ahead in the real track list, which is
+            # essentially never the track that was actually shown/clicked.
+            self._ensure_shuffle_order()
+            upcoming_positions = list(range(self.shuffle_position + 1, len(self.shuffle_order)))
+            if not (0 <= row < len(upcoming_positions)):
+                return
+            target_shuffle_position = upcoming_positions[row]
+            target_index = self.shuffle_order[target_shuffle_position]
+        elif self.playback_mode == 1 and is_live_context:
+            # Repeat playlist - the preview can wrap past the end back to
+            # the start (see _compute_upcoming_context_tracks), so a
+            # clicked row can correspond to an index before current_index,
+            # not just after it.
+            wrapped = list(range(current_index + 1, len(tracks))) + list(range(0, current_index))
+            if not (0 <= row < len(wrapped)):
+                return
+            target_index = wrapped[row]
+        else:
+            target_index = current_index + 1 + row
+            if not (0 <= target_index < len(tracks)):
+                return
+
+        if not is_live_context:
+            # Was mid-queue - this is the one case that actually needs to
+            # restore active_playing_tracks/album_key from the saved
+            # context. When already live, tracks IS self.active_playing_tracks
+            # already (see _effective_playback_context) - reassigning it
+            # to a new list() copy here would needlessly change its
+            # identity and trip _ensure_shuffle_order() into thinking the
+            # context changed, forcing an unwanted reshuffle.
+            self.active_playing_tracks = list(tracks)
+            self.active_playing_album_key = album_key
+            self._queue_return_context = None  # we've now returned to this context directly
+
+        if target_shuffle_position is not None:
+            self.shuffle_position = target_shuffle_position
+
         self._refresh_now_playing_outlines()
         self.play_track_at(target_index)
 
@@ -7606,6 +8144,17 @@ class AdaptiveMusicPlayer(QMainWindow):
     def open_settings_dialog(self):
         dialog = SettingsDialog(getattr(self, "_app_icon_pixmap", None), self)
         dialog.exec()
+        # The flame-badge toggle (Settings > Preferences) may have
+        # changed while this was open - if an artist's currently being
+        # viewed, reflect that immediately rather than waiting for the
+        # next time the artist view happens to refresh on its own.
+        # _apply_fan_favorite_badge already handles both directions (show
+        # it if there's cached data and the toggle's on, or clear every
+        # badge if it's off) from the exact same call.
+        if self.artist_filter_name:
+            cached_info = self._load_cached_artist_info(self.artist_filter_name)
+            candidates = cached_info.get("top_album_candidates", []) if cached_info else []
+            self._apply_fan_favorite_badge(self.artist_filter_name, candidates)
 
     def _get_lastfm_credentials(self):
         """Shared credential/settings check used by both now-playing and scrobble calls."""
@@ -7743,17 +8292,20 @@ class AdaptiveMusicPlayer(QMainWindow):
         # normally happen, but better to log something than nothing).
         real_album_key = self.track_to_album_key.get(path, self.active_playing_album_key)
         self._log_play(path, real_album_key)
-        # refresh_home_shelves() otherwise only ever runs on startup, on
-        # switching to the Home tab, or on pinning/unpinning an album -
-        # nothing previously re-rendered Jump Back In/Made For You/etc.
-        # just because a new play got logged, so staying on the Home tab
-        # while actually playing something (or playing from Home itself)
-        # meant the shelves never visibly updated no matter how much
-        # qualifying history piled up underneath. Cheap to call here since
-        # this whole method is already gated to run at most once per
-        # track (see _play_logged_for_current_track above), not on every
-        # position tick.
-        self.refresh_home_shelves()
+        # mark_home_shelves_dirty() otherwise only ever actually recomputes
+        # anything on startup, on switching to the Home tab, or on
+        # pinning/unpinning an album - nothing previously re-rendered Jump
+        # Back In/Made For You/etc. just because a new play got logged, so
+        # staying on the Home tab while actually playing something (or
+        # playing from Home itself) meant the shelves never visibly
+        # updated no matter how much qualifying history piled up
+        # underneath. Cheap to call here since this whole method is
+        # already gated to run at most once per track (see
+        # _play_logged_for_current_track above), not on every position
+        # tick - and mark_home_shelves_dirty() itself only does the actual
+        # (expensive) recompute if Home happens to be the visible tab
+        # right now anyway.
+        self.mark_home_shelves_dirty()
 
     def _log_play(self, path: str, album_key: Optional[str]):
         record = {"ts": int(time.time()), "path": path, "album_key": album_key}
@@ -8724,10 +9276,21 @@ class AdaptiveMusicPlayer(QMainWindow):
     def set_playback_mode(self, mode: int):
         self.playback_mode = mode
         self.loop_btn.set_mode(self.playback_mode)
+        if mode == 3 and self.active_playing_album_key != self.QUEUE_KEY:
+            # Reshuffles right away rather than waiting for the next
+            # track change - otherwise turning shuffle on and immediately
+            # opening the Queue view would have nothing valid to preview
+            # yet.
+            self._regenerate_shuffle_order()
         self._mpris_notify({
             "LoopStatus": {0: "None", 1: "Playlist", 2: "Track"}.get(mode, "None"),
             "Shuffle": mode == 3,
         })
+        # Mode changes don't go through play_track_at, which is what
+        # normally keeps the Queue view's "Next from X" preview live -
+        # without this, switching modes while that view is open wouldn't
+        # visibly update until the next track change.
+        self.refresh_views_if_active()
 
     def handle_media_status(self, status):
         if status == QMediaPlayer.MediaStatus.LoadedMedia and self._pending_resume_position_ms > 0:
