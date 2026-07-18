@@ -109,8 +109,8 @@ ARTIST_DETAIL_PHOTO_SIZE = 110  # the bigger photo shown in the artist detail pa
 # overwritten with the fresh response, not two separate requests.
 ARTIST_STATS_MAX_AGE_SECONDS = 1 * 86400
 ARTIST_BIO_MAX_AGE_SECONDS = 90 * 86400
-ORG_NAME = "RohanApps"
-APP_NAME = "AdaptiveMusicPlayer"
+ORG_NAME = "RoPlayer"
+APP_NAME = "RoPlayer"
 APP_VERSION = "1.0.0"
 APP_REPO_URL = "https://github.com/rohanisawesome/RoPlayer"
 
@@ -338,7 +338,7 @@ class LastfmWorker(QThread):
         self.session_key = session_key
 
     def run(self):
-        settings = QSettings("RohanApps", "AdaptiveMusicPlayer")
+        settings = QSettings(ORG_NAME, APP_NAME)
         api_key = LASTFM_API_KEY
         api_secret = LASTFM_API_SECRET
         saved_sk = settings.value("lfm_sk", "").strip()
@@ -376,7 +376,7 @@ class LastfmWorker(QThread):
         try:
             data = urllib.parse.urlencode(params).encode("utf-8")
             req = urllib.request.Request("https://ws.audioscrobbler.com/2.0/", data=data)
-            req.add_header("User-Agent", "AdaptiveMusicPlayer/2.0")
+            req.add_header("User-Agent", "RoPlayer/2.0")
 
             with urllib.request.urlopen(req, timeout=6) as response:
                 resp_data = json.loads(response.read().decode("utf-8"))

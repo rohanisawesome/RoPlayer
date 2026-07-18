@@ -26,13 +26,16 @@ A desktop music player for Linux, built with PyQt6. Point it at a folder of loca
 
 ### Arch Linux
 
-A `PKGBUILD` is included:
+A `PKGBUILD` is included and pulls in every dependency (including the Qt6 multimedia backend) automatically:
 
 ```bash
+git clone https://github.com/rohanisawesome/RoPlayer.git
+cd RoPlayer
 makepkg -si
+roplayer
 ```
 
-### Manual
+### Manual (any distro)
 
 ```bash
 git clone https://github.com/rohanisawesome/RoPlayer.git
@@ -40,6 +43,33 @@ cd RoPlayer
 pip install PyQt6 mutagen pychromecast
 python player.py
 ```
+
+Optional, for MPRIS2 desktop integration (media keys, tray "now playing"):
+
+```bash
+pip install dbus-python PyGObject
+```
+
+`dbus-python` and `PyGObject` need system D-Bus/GLib headers to build. If the
+`pip install` above fails, install them from your distro's repos instead
+(e.g. `sudo pacman -S python-dbus python-gobject` on Arch, or
+`sudo apt install python3-dbus python3-gi` on Debian/Ubuntu) — RoPlayer runs
+fine without them either way, just without those extras.
+
+#### No sound after launching?
+
+`pip install PyQt6` installs the Qt bindings, but Qt's multimedia playback
+still needs a system-level FFmpeg (or GStreamer) backend to actually decode
+audio — pip can't install that part for you. If the window opens but nothing
+plays:
+
+- **Arch**: `sudo pacman -S qt6-multimedia qt6-multimedia-ffmpeg`
+- **Debian/Ubuntu**: `sudo apt install ffmpeg`
+- **Fedora**: `sudo dnf install qt6-qtmultimedia ffmpeg`
+
+This is a known Linux-specific PyQt6 packaging quirk, not something specific
+to RoPlayer — the Arch package above avoids it entirely since `makepkg -si`
+pulls the backend in as a dependency.
 
 ## Usage
 
@@ -52,8 +82,8 @@ Launch RoPlayer and point it at your music folder to build your library. From th
 
 ## Configuration & data
 
-- Settings are stored via `QSettings` under the `RohanApps/AdaptiveMusicPlayer` namespace.
-- Cached artist images, bios, and stats live in `~/.cache/AdaptiveMusicPlayer`.
+- Settings are stored via `QSettings` under the `RoPlayer/RoPlayer` namespace (`~/.config/RoPlayer/`).
+- Cached artist images, bios, and stats live in `~/.cache/RoPlayer` (or `~/.local/share/RoPlayer` depending on your desktop's XDG config).
 - Last.fm session keys are stored locally per-user and are never included in this repository.
 
 ## License

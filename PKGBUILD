@@ -1,13 +1,13 @@
-pkgname=my-music-player
+pkgname=roplayer
 pkgver=1.1.6
 pkgrel=1
-pkgdesc="My custom Python music player"
+pkgdesc="RoPlayer - a desktop music player for Linux built with PyQt6"
 arch=('any')
 license=('GPL')
 depends=('python' 'python-pyqt6' 'python-mutagen' 'python-pychromecast' 'python-dbus' 'python-gobject')
 
 package() {
-    install -d "${pkgdir}/usr/share/my-music-player"
+    install -d "${pkgdir}/usr/share/roplayer"
     install -d "${pkgdir}/usr/bin"
     install -d "${pkgdir}/usr/share/applications"
     install -d "${pkgdir}/usr/share/pixmaps"
@@ -17,8 +17,8 @@ package() {
     # for the actual window/taskbar icon while the app is running.
     install -m644 "${startdir}/icon.png" "${pkgdir}/usr/share/pixmaps/roplayer.png"
 
-    cp "${startdir}/player.py" "${pkgdir}/usr/share/my-music-player/"
-    install -m755 "${startdir}/my-music-player" "${pkgdir}/usr/bin/my-music-player"
+    cp "${startdir}/player.py" "${pkgdir}/usr/share/roplayer/"
+    install -m755 "${startdir}/roplayer" "${pkgdir}/usr/bin/roplayer"
 
     # Must be installed as roplayer.desktop specifically - player.py calls
     # app.setDesktopFileName("roplayer"), which tells KDE/GNOME this

@@ -1,7 +1,7 @@
 [Desktop Entry]
 Name=RoPlayer
 Comment=Local music player
-Exec=my-music-player
+Exec=roplayer
 Icon=roplayer
 Type=Application
 Categories=AudioVideo;Player;
