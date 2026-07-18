@@ -46,7 +46,8 @@ from PyQt6.QtCore import (
 
 from PyQt6.QtGui import (
     QPixmap, QIcon, QColor, QImage, QPainter, QPainterPath, QShortcut, 
-    QKeySequence, QAction, QActionGroup, QPen, QFont, QCursor, QFontMetrics, QLinearGradient
+    QKeySequence, QAction, QActionGroup, QPen, QFont, QCursor, QFontMetrics, QLinearGradient,
+    QPalette
 )
 
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
@@ -11269,6 +11270,27 @@ if __name__ == "__main__":
     # independent and guaranteed to render this stylesheet identically
     # everywhere.
     app.setStyle("Fusion")
+    # Fusion controls *how* widgets render, not their colors - its own
+    # default palette is light. Anything in the UI without an explicit QSS
+    # background-color rule (raw QScrollArea viewports especially, used to
+    # wrap the Library/Playlists/Artists grids) was falling back to that
+    # light default palette, not the app's dark theme. This rendered fine
+    # on systems that happen to already have a dark Qt palette configured
+    # at the OS/desktop level (common on many Arch+KDE setups via qt6ct or
+    # Breeze integration) purely by coincidence - and plain white on any
+    # system without one, since the app itself never actually set its own
+    # palette. Setting it explicitly here removes that dependency on the
+    # user's system Qt config entirely.
+    dark_base = QColor(18, 20, 24)  # same default apply_theme() starts with
+    dark_palette = QPalette()
+    for role in (QPalette.ColorRole.Window, QPalette.ColorRole.Base,
+                 QPalette.ColorRole.AlternateBase, QPalette.ColorRole.Button,
+                 QPalette.ColorRole.ToolTipBase):
+        dark_palette.setColor(role, dark_base)
+    for role in (QPalette.ColorRole.WindowText, QPalette.ColorRole.Text,
+                 QPalette.ColorRole.ButtonText, QPalette.ColorRole.ToolTipText):
+        dark_palette.setColor(role, QColor(255, 255, 255))
+    app.setPalette(dark_palette)
     # Run directly from a terminal (python player.py) rather than via an
     # installed launcher, so Qt has no automatic way to know this process
     # corresponds to roplayer.desktop. Several desktop-integration features
