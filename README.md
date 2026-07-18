@@ -4,15 +4,29 @@ A desktop music player for Linux, built with PyQt6. Point it at a folder of loca
 
 ## Features
 
+### Library & browsing
+
 - **Local library scanning** — recursively scans a music folder, grouping tracks into albums by folder and tag metadata. Supports `.mp3`, `.flac`, `.m4a`, `.mp4`, `.ogg`, `.oga`, `.wav`, `.wma`, and `.aac`.
 - **Cover art & tags** — pulls embedded artwork and metadata (artist, album, year, title) straight from your files via Mutagen.
 - **Home, Library, and Artist views** — browsable shelves and artist detail pages with photos and public listener/scrobble stats.
+- **Pinned albums** — pin favorites to keep them anchored at the front of your library grid, independent of whatever sort order you're using.
+- **Playlists** — build your own playlists, add and reorder tracks, rename or delete them, and set a custom cover image per playlist.
+- **Queue** — a dedicated up-next view separate from whatever playlist or album you're currently browsing.
+- **Search** — instant filtering as you type (3+ characters) across your whole library.
+
+### Playback
+
+- **Playback modes** — shuffle and repeat (off / repeat playlist / repeat one track), with playback position remembered between sessions.
+- **Showcase view** — hit `Tab` for a distraction-free, full-screen now-playing view.
+- **Dynamic theming** — the app's accent color shifts to match whatever's playing, pulled straight from that track's own cover art, with a smooth crossfade between themes.
+- **Keyboard shortcuts** — `Space` to play/pause, `Tab` to toggle Showcase view.
+
+### Integration
+
 - **Last.fm scrobbling** — logs in via your browser, tracks now-playing status, and scrobbles as you listen.
 - **Lyrics view** — dedicated panel for following along while a track plays.
 - **Chromecast support** — cast playback to any Chromecast device on your network.
 - **MPRIS2 integration** — media keys, system tray widgets, and lock-screen "now playing" info on Linux desktops (KDE Plasma, GNOME, etc.) via D-Bus.
-- **Playback modes** — shuffle and repeat (track/playlist), with playback position remembered between sessions.
-- **Search** — quick search across your library.
 
 ## Requirements
 
