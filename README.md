@@ -4,29 +4,46 @@ A desktop music player for Linux, built with PyQt6. Point it at a folder of loca
 
 ## Features
 
-### Library & browsing
+### Home
 
-- **Local library scanning** — recursively scans a music folder, grouping tracks into albums by folder and tag metadata. Supports `.mp3`, `.flac`, `.m4a`, `.mp4`, `.ogg`, `.oga`, `.wav`, `.wma`, and `.aac`.
-- **Cover art & tags** — pulls embedded artwork and metadata (artist, album, year, title) straight from your files via Mutagen.
-- **Home, Library, and Artist views** — browsable shelves and artist detail pages with photos and public listener/scrobble stats.
-- **Pinned albums** — pin favorites to keep them anchored at the front of your library grid, independent of whatever sort order you're using.
-- **Playlists** — build your own playlists, add and reorder tracks, rename or delete them, and set a custom cover image per playlist.
-- **Queue** — a dedicated up-next view separate from whatever playlist or album you're currently browsing.
-- **Search** — instant filtering as you type (3+ characters) across your whole library.
+Auto-generated, YouTube Music-style shelves built entirely from your own local listening history — nothing pulled from an online account:
+
+- **Replay Mix** — your top tracks over the last 2 weeks
+- **On Repeat** — what you're playing right now
+- **Forgotten Favorites** — old favorites you've drifted away from
+- **Night Owl** / **Morning Mix** / **Weekend Mix** — mixes built around when you actually listen
+- **Album Rewind** — whole albums you used to spin and have since stopped
+- **Month Rewind** — your top tracks from a specific past month
+
+### Library
+
+Recursively scans a folder of local audio files — `.mp3`, `.flac`, `.m4a`, `.mp4`, `.ogg`, `.oga`, `.wav`, `.wma`, `.aac` — grouping tracks into albums by folder and tag metadata, with cover art and metadata pulled straight from your files via Mutagen. Pin favorite albums to keep them anchored at the front of the grid regardless of sort order, and use the search bar (3+ characters) for instant filtering across your whole collection.
+
+### Artists View
+
+Dedicated pages per artist, pulling public bio text, listener counts, and play counts straight from Last.fm's read-only artist API (no login needed for this part), plus artist photos, top tracks — cross-referenced against your own library so anything you actually own is playable straight from the list — and top albums ranked by Last.fm listener count.
+
+### Playlists
+
+Build your own playlists from any tracks in your library: add and remove tracks, reorder, rename, delete, and set a custom cover image per playlist, independent of whatever art the tracks themselves carry.
+
+### Lyrics
+
+A dedicated full-screen panel that follows along as a track plays. RoPlayer reads lyrics from a `.lrc` or `.txt` file sitting next to the audio file itself (same filename, different extension) — a `.lrc` with timestamps gets line-by-line synced highlighting, while a plain `.txt` just displays as static lyrics. Lyrics aren't fetched from the internet automatically, so you'll need to supply your own files for a track to show anything beyond "Lyrics not available."
 
 ### Playback
 
-- **Playback modes** — shuffle and repeat (off / repeat playlist / repeat one track), with playback position remembered between sessions.
-- **Showcase view** — hit `Tab` for a distraction-free, full-screen now-playing view.
-- **Dynamic theming** — the app's accent color shifts to match whatever's playing, pulled straight from that track's own cover art, with a smooth crossfade between themes.
-- **Keyboard shortcuts** — `Space` to play/pause, `Tab` to toggle Showcase view.
+- **Playback modes** — shuffle and repeat (off / repeat playlist / repeat one track), with playback position remembered between sessions
+- **Queue** — a dedicated up-next view separate from whatever playlist or album you're currently browsing
+- **Showcase view** — hit `Tab` for a distraction-free, full-screen now-playing view
+- **Dynamic theming** — the app's accent color shifts to match whatever's playing, pulled straight from that track's own cover art, with a smooth crossfade between themes
+- **Keyboard shortcuts** — `Space` to play/pause, `Tab` to toggle Showcase view
 
 ### Integration
 
-- **Last.fm scrobbling** — logs in via your browser, tracks now-playing status, and scrobbles as you listen.
-- **Lyrics view** — dedicated panel for following along while a track plays.
-- **Chromecast support** — cast playback to any Chromecast device on your network.
-- **MPRIS2 integration** — media keys, system tray widgets, and lock-screen "now playing" info on Linux desktops (KDE Plasma, GNOME, etc.) via D-Bus.
+- **Last.fm scrobbling** — logs in via your browser, tracks now-playing status, and scrobbles as you listen
+- **Chromecast support** — cast playback to any Chromecast device on your network
+- **MPRIS2 integration** — media keys, system tray widgets, and lock-screen "now playing" info on Linux desktops (KDE Plasma, GNOME, etc.) via D-Bus
 
 ## Requirements
 
