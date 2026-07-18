@@ -890,7 +890,7 @@ class SettingsDialog(QDialog):
     def __init__(self, app_icon_pixmap: Optional[QPixmap], parent=None):
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        self.setFixedSize(760, 440)
+        self.setFixedSize(800, 460)
         # Frameless, with its own title bar built below - a native OS
         # title bar (what a plain QDialog gets by default) looks
         # visually disconnected from the rest of this app, which never
@@ -921,24 +921,48 @@ class SettingsDialog(QDialog):
             }}
             QPushButton#DialogCloseButton:hover {{ background-color: {self._ACCENT}; color: #FFFFFF; }}
             QLabel {{ color: #FFFFFF; }}
-            QListWidget {{
+            QWidget#SettingsSidebar {{
                 background-color: #121317;
-                border: none;
                 border-right: 1px solid rgba(255,255,255,0.06);
+            }}
+            QListWidget {{
+                background-color: transparent;
+                border: none;
                 outline: none;
-                padding: 16px 0px;
+                padding: 12px 6px;
             }}
             QListWidget::item {{
                 color: rgba(255,255,255,0.55);
                 font-weight: 600;
                 font-size: 12px;
-                padding: 12px 18px;
+                padding: 11px 12px;
                 border: none;
+                border-radius: 8px;
+            }}
+            QListWidget::item:hover {{
+                background-color: rgba(255,255,255,0.05);
+                color: rgba(255,255,255,0.8);
             }}
             QListWidget::item:selected {{
-                background-color: rgba(255,255,255,0.06);
+                background-color: rgba(229, 72, 77, 0.16);
                 color: #FFFFFF;
-                border-left: 2px solid {self._ACCENT};
+            }}
+            QWidget#SettingsSidebarFooter {{
+                border-top: 1px solid rgba(255,255,255,0.06);
+            }}
+            QLabel#SettingsSidebarFooterIcon {{
+                background-color: {self._ACCENT};
+                border-radius: 5px;
+                font-size: 10px;
+                font-weight: 700;
+                color: rgba(255,255,255,0.85);
+            }}
+            QLabel#SettingsSidebarFooterTitle {{ font-size: 11px; font-weight: 700; color: rgba(255,255,255,0.6); }}
+            QLabel#SettingsSidebarFooterVersion {{ font-size: 10px; font-weight: 500; color: rgba(255,255,255,0.35); }}
+            QLabel#SettingsSectionLabel {{
+                font-size: 10px;
+                font-weight: 800;
+                color: rgba(255,255,255,0.35);
             }}
             QPushButton#SettingsLinkButton {{
                 background-color: rgba(255,255,255,0.05);
@@ -982,23 +1006,12 @@ class SettingsDialog(QDialog):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # Preferences first - it's the actionable page (toggles that
-        # actually change something), About is just static/informational,
-        # so it makes sense as the second stop rather than the default
-        # landing page.
-        sidebar = QListWidget(self)
-        sidebar.setFixedWidth(150)
-        sidebar.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        sidebar.setSpacing(3)
-        sidebar.addItem("Preferences")
-        sidebar.addItem("About")
-        sidebar.setCurrentRow(0)
-        layout.addWidget(sidebar)
+        layout.addWidget(self._build_sidebar(app_icon_pixmap))
 
         self._content_stack = QStackedWidget(self)
         self._content_stack.addWidget(self._wrap_settings_page(self._build_preferences_page()))
         self._content_stack.addWidget(self._wrap_settings_page(self._build_about_page(app_icon_pixmap)))
-        sidebar.currentRowChanged.connect(self._content_stack.setCurrentIndex)
+        self._sidebar_list.currentRowChanged.connect(self._content_stack.setCurrentIndex)
         layout.addWidget(self._content_stack, stretch=1)
 
         outer_layout.addWidget(body, stretch=1)
@@ -1015,6 +1028,97 @@ class SettingsDialog(QDialog):
             x = parent_geo.x() + (parent_geo.width() - self.width()) // 2
             y = parent_geo.y() + (parent_geo.height() - self.height()) // 2
             self.move(max(0, x), max(0, y))
+
+    def _build_sidebar(self, app_icon_pixmap: Optional[QPixmap]) -> QWidget:
+        # A nav list plus a small branded footer underneath, rather than
+        # just the list on its own - with only two entries (Preferences/
+        # About), a bare list left most of this column empty air with
+        # nothing anchoring the bottom of it, which is what actually read
+        # as "off"/unfinished rather than any single element being
+        # technically broken. The footer gives that space a reason to be
+        # there instead of trying to force the list to fill it.
+        container = QWidget(self)
+        container.setObjectName("SettingsSidebar")
+        container.setFixedWidth(212)
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.setSpacing(0)
+
+        # Preferences first - it's the actionable page (toggles that
+        # actually change something), About is just static/informational,
+        # so it makes sense as the second stop rather than the default
+        # landing page.
+        self._sidebar_list = QListWidget(container)
+        self._sidebar_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        # QSS margin/spacing on ::item isn't reliably honored by a list
+        # view's item delegate the way it is on an ordinary box widget -
+        # setSpacing() is the real, dependable way to put visual daylight
+        # between rows here, which is what the rounded-pill selection
+        # highlight (see the stylesheet) actually needs to not look like
+        # it's crowding the row below it.
+        self._sidebar_list.setSpacing(4)
+        for icon, text in (("\u2699", "Preferences"), ("\u2139", "About")):
+            item = QListWidgetItem(self._sidebar_list)
+            item.setSizeHint(QSize(0, 40))
+            self._sidebar_list.setItemWidget(item, self._build_sidebar_nav_row(icon, text))
+        self._sidebar_list.setCurrentRow(0)
+        container_layout.addWidget(self._sidebar_list, stretch=1)
+
+        footer = QWidget(container)
+        footer.setObjectName("SettingsSidebarFooter")
+        footer_layout = QHBoxLayout(footer)
+        footer_layout.setContentsMargins(16, 12, 16, 12)
+        footer_layout.setSpacing(10)
+
+        footer_icon = QLabel(footer)
+        footer_icon.setObjectName("SettingsSidebarFooterIcon")
+        footer_icon.setFixedSize(26, 26)
+        footer_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        if app_icon_pixmap is not None and not app_icon_pixmap.isNull():
+            footer_icon.setPixmap(app_icon_pixmap.scaled(
+                26, 26, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+            ))
+        else:
+            footer_icon.setText("\u266a")
+        footer_layout.addWidget(footer_icon)
+
+        footer_text_col = QVBoxLayout()
+        footer_text_col.setSpacing(0)
+        footer_title = QLabel("RoPlayer", footer)
+        footer_title.setObjectName("SettingsSidebarFooterTitle")
+        footer_version = QLabel(f"v{APP_VERSION}", footer)
+        footer_version.setObjectName("SettingsSidebarFooterVersion")
+        footer_text_col.addWidget(footer_title)
+        footer_text_col.addWidget(footer_version)
+        footer_layout.addLayout(footer_text_col)
+        footer_layout.addStretch(1)
+
+        container_layout.addWidget(footer)
+        return container
+
+    def _build_sidebar_nav_row(self, icon: str, text: str) -> QWidget:
+        # A real per-row widget (separate icon label + text label),
+        # rather than an icon character prefixed directly into the
+        # item's own plain text - each label sizes independently here,
+        # so there's no risk of one glyph's font metrics throwing off the
+        # whole row's height the way mixing them into one text run did.
+        # Text-style symbols (no emoji variation selector), so they still
+        # render with the same plain font as everything else rather than
+        # pulling in a separate color-emoji font with its own line-height.
+        row = QWidget()
+        row.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(10, 0, 8, 0)
+        layout.setSpacing(10)
+        icon_lbl = QLabel(icon, row)
+        icon_lbl.setFixedWidth(16)
+        icon_lbl.setStyleSheet("font-size: 13px; color: rgba(255,255,255,0.7); background: transparent; border: none;")
+        text_lbl = QLabel(text, row)
+        text_lbl.setStyleSheet("font-size: 12px; font-weight: 600; color: rgba(255,255,255,0.85); background: transparent; border: none;")
+        layout.addWidget(icon_lbl)
+        layout.addWidget(text_lbl)
+        layout.addStretch(1)
+        return row
 
     def _wrap_settings_page(self, page: QWidget) -> QWidget:
         # Shared margins for every sidebar page, so each _build_*_page()
@@ -1062,6 +1166,10 @@ class SettingsDialog(QDialog):
         heading = QLabel("Preferences", page)
         heading.setStyleSheet("font-size: 15px; font-weight: 800; color: rgba(255,255,255,0.95);")
         page_layout.addWidget(heading)
+
+        section_lbl = QLabel("GENERAL", page)
+        section_lbl.setObjectName("SettingsSectionLabel")
+        page_layout.addWidget(section_lbl)
 
         card, card_layout = self._build_card_container()
 
@@ -3391,6 +3499,25 @@ class AdaptiveMusicPlayer(QMainWindow):
     # Rename/Delete only for playlists, never for a generated mix.
     PLAYLIST_KEY_PREFIX = "__playlist__"
 
+    # Every smart mix (Replay Mix, Night Owl, an artist's own "Top Songs
+    # as Mix", etc. - see _set_mix) uses this prefix. The Playlist Tracks
+    # view (see open_playlist_detail_view/_refresh_playlist_detail_header)
+    # checks this prefix to show a mix there too, read-only - browsable
+    # and playable exactly like a real playlist, but with no rename/
+    # cover/delete and no add/remove-track support, since a mix's
+    # contents are algorithmically generated rather than something a
+    # person builds track-by-track.
+    MIX_KEY_PREFIX = "__mix__"
+
+    # Historical manual add/remove edits some earlier build of this app
+    # let someone layer on top of a smart mix's own algorithmic picks
+    # (see _set_mix) - key -> {"added": [paths...], "removed":
+    # [paths...]}. That editing UI is gone now (mixes are read-only, see
+    # MIX_KEY_PREFIX above), but _set_mix still honors whatever overrides
+    # were already saved here before, rather than silently discarding
+    # anyone's existing customization.
+    MIX_OVERRIDES_SETTINGS_KEY = "mix_track_overrides"
+
     # Sentinel active_playing_album_key while a manually-queued track (one
     # added via "Play Next"/"Add to Queue", not part of whatever album/mix/
     # playlist is currently being browsed) is what's actually playing - see
@@ -3500,6 +3627,14 @@ class AdaptiveMusicPlayer(QMainWindow):
                 self.user_playlists = {}
         except Exception:
             self.user_playlists = {}
+
+        # See MIX_OVERRIDES_SETTINGS_KEY above for what this holds and why.
+        try:
+            self.mix_track_overrides: dict = json.loads(self.settings.value(self.MIX_OVERRIDES_SETTINGS_KEY, "{}") or "{}")
+            if not isinstance(self.mix_track_overrides, dict):
+                self.mix_track_overrides = {}
+        except Exception:
+            self.mix_track_overrides = {}
 
         # How the Playlists grid is currently ordered - see
         # PLAYLIST_SORT_MODES/_ordered_playlists().
@@ -3828,7 +3963,29 @@ class AdaptiveMusicPlayer(QMainWindow):
 
         QShortcut(QKeySequence(Qt.Key.Key_Space), self, activated=self.toggle_play)
         QShortcut(QKeySequence(Qt.Key.Key_Tab), self, activated=self.toggle_showcase_view)
-        
+
+        # Backs _crossfade_window() - a plain QLabel showing a frozen
+        # snapshot of the window right before something's about to
+        # change instantly (a new track's theme color, leaving the
+        # artist-detail view...), fading away to reveal the real change
+        # underneath. Named for its original use (apply_theme's own
+        # color-change fade) but general-purpose now - see
+        # _crossfade_window for the other case. Parented straight to the
+        # window itself, not the central widget, so it sits above
+        # literally everything, title bar included.
+        self._theme_fade_overlay = QLabel(self)
+        self._theme_fade_overlay.setObjectName("ThemeFadeOverlay")
+        self._theme_fade_overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._theme_fade_overlay.hide()
+        self._theme_fade_opacity_effect = QGraphicsOpacityEffect(self._theme_fade_overlay)
+        self._theme_fade_opacity_effect.setOpacity(0.0)
+        self._theme_fade_overlay.setGraphicsEffect(self._theme_fade_opacity_effect)
+        self._theme_fade_anim: Optional[QPropertyAnimation] = None
+        # Flips True after the very first apply_theme() call below - that
+        # first call is just the startup default color, not a real
+        # transition, so it shouldn't fade from a blank/pre-launch grab.
+        self._theme_initialized = False
+
         self.apply_theme(QColor(18, 20, 24))
         self._refresh_queue_panel()
 
@@ -4123,6 +4280,20 @@ class AdaptiveMusicPlayer(QMainWindow):
         # Library here silently do nothing at all instead of resetting.
         if (index == self.TAB_LIBRARY and self.artist_filter_name is not None
                 and self.view_stack.currentIndex() == self.TAB_LIBRARY):
+            # The content about to change (artist bio/photo/Top Songs ->
+            # a plain album grid) is a real, visually big swap - but
+            # since view_stack's own index isn't moving, FadingStackedWidget
+            # never gets a chance to crossfade it the way a normal tab
+            # switch does, and it would otherwise just snap instantly.
+            # Reuses the same grab-a-snapshot-and-fade-it-away trick
+            # apply_theme() uses for the same underlying reason (see
+            # _crossfade_window) - safe to rebuild the grid right
+            # underneath it because that snapshot is a frozen QPixmap,
+            # not a live effect on the widget being rebuilt (unlike
+            # FadingStackedWidget's own crossfade, which close_artist_detail_view's
+            # own comment notes can NOT tolerate mutating the outgoing
+            # page mid-fade).
+            self._crossfade_window()
             self.clear_artist_filter()
 
         self.active_top_level_tab = index
@@ -4270,6 +4441,18 @@ class AdaptiveMusicPlayer(QMainWindow):
     ALBUM_REWIND_KEY = "__mix__album_rewind"
     MONTH_REWIND_KEY = "__mix__month_rewind"
 
+    # Every "Made For You" mix - the personal, algorithmic ones, as
+    # opposed to an artist's own "Top Songs as Mix" (built from a
+    # per-artist key instead - see _artist_top_songs_mix_key). Used to
+    # let Jump Back In recognize heavy listening to one of *these*
+    # specifically (see get_jump_back_in_entries) without also picking
+    # up every artist's Top Songs mix, which isn't really "made for you"
+    # in the same sense - it's just that one artist's own popular tracks.
+    MADE_FOR_YOU_MIX_KEYS = (
+        REPLAY_MIX_KEY, ON_REPEAT_KEY, FORGOTTEN_FAVORITES_KEY, NIGHT_OWL_KEY,
+        MORNING_MIX_KEY, WEEKEND_MIX_KEY, ALBUM_REWIND_KEY, MONTH_REWIND_KEY,
+    )
+
     # Shared cap on how many tracks any single generated smart mix can
     # hold - keeps them feeling like a curated mix rather than "your
     # entire history for this window" once play counts grow.
@@ -4297,35 +4480,60 @@ class AdaptiveMusicPlayer(QMainWindow):
     # play of each song).
     _JUMP_BACK_IN_ALBUM_MIN_FRACTION = 0.6
     _JUMP_BACK_IN_ALBUM_MIN_TRACKS = 3
+    # A Made For You mix or a user playlist earns its own Jump Back In
+    # card once at least this many qualifying plays (see
+    # _maybe_log_play's threshold) came through it specifically within
+    # the window - counted by distinct track, the same way an album's
+    # own "played track-by-track" check above is, so replaying one song
+    # from it a bunch of times doesn't by itself count as "been
+    # listening to this mix/playlist a lot."
+    _JUMP_BACK_IN_CONTEXT_MIN_TRACKS = 3
 
     def get_jump_back_in_entries(self) -> list:
-        # Builds the mixed track/album Jump Back In bar. A singular track
-        # you've been playing on repeat surfaces as its own track card; an
-        # album you've been working through track-by-track surfaces as an
-        # album card instead. Both kinds are ranked together by how
-        # recently they qualified (play count only breaks a tie) so the
-        # bar reads left to right as "what you were most recently into"
-        # regardless of whether that's one song or a whole record.
+        # Builds the mixed track/album/mix/playlist Jump Back In bar. A
+        # singular track you've been playing on repeat surfaces as its
+        # own track card; an album you've been working through track-by-
+        # track surfaces as an album card; a Made For You mix or a
+        # playlist you've been drawing several different tracks from
+        # surfaces as its own card too (see context_track_plays below).
+        # All of them are ranked together by how recently they qualified
+        # (play count only breaks a tie) so the bar reads left to right
+        # as "what you were most recently into" regardless of what kind
+        # of thing that was.
         #
-        # Returns a list of dicts: {"mode": "track"|"album", "album_key",
-        # "track_path" (only for "track")}.
+        # Returns a list of dicts: {"mode": "track"|"album"|"playlist",
+        # "album_key", "track_path" (only for "track")}.
         since_ts = int(time.time()) - self.JUMP_BACK_IN_WINDOW_DAYS * 86400
 
         # album_key -> {track_path: [play ts, ...]} for real, still-
         # scanned albums only - a play logged under a synthetic mix key
         # (Replay Mix etc.) has no stable "album" to attribute it to, so
         # those are excluded here rather than recursively feeding a smart
-        # mix's plays back into Jump Back In.
+        # mix's plays back into Jump Back In as an album.
+        #
+        # context_key -> {track_path: [play ts, ...]} alongside it, for
+        # whichever plays came through a Made For You mix or a real
+        # playlist specifically (see _log_play's context_key) - an
+        # artist's own Top Songs mix and anything else synthetic is
+        # deliberately excluded (see MADE_FOR_YOU_MIX_KEYS), and a
+        # play started directly from its own real album never has a
+        # context_key at all, so it only ever shows up in the dict above.
         album_track_plays: dict[str, dict[str, list]] = {}
+        context_track_plays: dict[str, dict[str, list]] = {}
         for record in self.get_recent_plays(since_ts=since_ts):
             path = record.get("path")
-            album_key = record.get("album_key")
             ts = record.get("ts")
             if not path or ts is None or not os.path.exists(path):
                 continue
-            if not album_key or album_key.startswith("__mix__") or album_key not in self.album_tracks:
-                continue
-            album_track_plays.setdefault(album_key, {}).setdefault(path, []).append(ts)
+
+            album_key = record.get("album_key")
+            if album_key and not album_key.startswith("__mix__") and album_key in self.album_tracks:
+                album_track_plays.setdefault(album_key, {}).setdefault(path, []).append(ts)
+
+            context_key = record.get("context_key")
+            if (context_key and context_key in self.album_tracks
+                    and (context_key in self.MADE_FOR_YOU_MIX_KEYS or context_key.startswith(self.PLAYLIST_KEY_PREFIX))):
+                context_track_plays.setdefault(context_key, {}).setdefault(path, []).append(ts)
 
         # --- Album candidates: played through track-by-track --------------
         album_candidates = []
@@ -4373,7 +4581,25 @@ class AdaptiveMusicPlayer(QMainWindow):
             for album_key, (path, count, most_recent) in best_track_per_album.items()
         ]
 
-        combined = album_candidates + track_candidates
+        # --- Mix/playlist candidates: drawn from a lot within it ----------
+        # Distinct tracks, not total plays - qualifies the same way an
+        # album counts as "played track-by-track" above (several
+        # different songs from it, not just one song replayed a bunch of
+        # times, which the track-candidate check above already covers on
+        # its own terms).
+        context_candidates = []
+        for context_key, per_track in context_track_plays.items():
+            if len(per_track) < self._JUMP_BACK_IN_CONTEXT_MIN_TRACKS:
+                continue
+            context_candidates.append({
+                "mode": "playlist" if context_key.startswith(self.PLAYLIST_KEY_PREFIX) else "album",
+                "album_key": context_key,
+                "track_path": None,
+                "score": sum(len(ts_list) for ts_list in per_track.values()),
+                "recent_ts": max(max(ts_list) for ts_list in per_track.values()),
+            })
+
+        combined = album_candidates + track_candidates + context_candidates
         # Recency first, not score first - "you seem pretty sad" from
         # earlier this week shouldn't sit ahead of something you only
         # just crossed the replay threshold on today just because it has
@@ -4392,6 +4618,26 @@ class AdaptiveMusicPlayer(QMainWindow):
         # etc.) treat it correctly without any special-casing.
         self.album_tracks.pop(key, None)
         self.album_display_meta.pop(key, None)
+
+        # Layers any manual edits from MIX_OVERRIDES_SETTINGS_KEY on top
+        # of whatever the algorithm just picked, every single time it
+        # recomputes - a leftover from an earlier build's mix-editing UI
+        # (see that constant's own comment). Nothing writes new overrides
+        # anymore, but honoring ones that already exist means nobody's
+        # past customization just silently vanished when that UI was
+        # removed. A manual removal always wins even over a fresh
+        # algorithmic pick, on the theory that "I don't want this here"
+        # is a deliberate choice
+        # that shouldn't get silently overridden the moment the algorithm
+        # agrees to disagree.
+        overrides = self.mix_track_overrides.get(key)
+        if overrides:
+            removed = set(overrides.get("removed", []))
+            track_paths = [p for p in track_paths if p not in removed]
+            for path in overrides.get("added", []):
+                if path not in track_paths and os.path.exists(path):
+                    track_paths.append(path)
+
         if not track_paths:
             return
 
@@ -4406,6 +4652,9 @@ class AdaptiveMusicPlayer(QMainWindow):
             "is_mix": True,
             "mix_style": style,
         }
+
+    def _save_mix_track_overrides(self):
+        self.settings.setValue(self.MIX_OVERRIDES_SETTINGS_KEY, json.dumps(self.mix_track_overrides))
 
     # --------------------------------------------------- User playlists --
     # Real, user-created "make my own playlist, add whatever I want, name
@@ -4544,7 +4793,7 @@ class AdaptiveMusicPlayer(QMainWindow):
         # now, its heading still shows the old name until refreshed.
         if self.browsing_album_key == self._playlist_key(playlist_id):
             self.display_album_tracks_by_key(self.browsing_album_key)
-        self._refresh_playlist_detail_if_open(playlist_id)
+        self._refresh_playlist_detail_if_open(self._playlist_key(playlist_id))
 
     def prompt_delete_playlist(self, playlist_id: str):
         record = self.user_playlists.get(playlist_id)
@@ -4595,6 +4844,7 @@ class AdaptiveMusicPlayer(QMainWindow):
             self.play_btn.set_playing(False)
             self.is_playing = False
             self._refresh_now_playing_outlines(force=True)
+            self._refresh_playlist_detail_play_button()
 
     def add_tracks_to_playlist(self, playlist_id: str, track_paths: list):
         record = self.user_playlists.get(playlist_id)
@@ -4612,7 +4862,7 @@ class AdaptiveMusicPlayer(QMainWindow):
         self.rebuild_playlist_grid()
         if self.browsing_album_key == self._playlist_key(playlist_id):
             self.display_album_tracks_by_key(self.browsing_album_key)
-        self._refresh_playlist_detail_if_open(playlist_id)
+        self._refresh_playlist_detail_if_open(self._playlist_key(playlist_id))
         if added:
             noun = "track" if added == 1 else "tracks"
             self.status_label.setText(f"Added {added} {noun} to \u201c{record['name']}\u201d")
@@ -4630,7 +4880,7 @@ class AdaptiveMusicPlayer(QMainWindow):
         self.rebuild_playlist_grid()
         if self.browsing_album_key == self._playlist_key(playlist_id):
             self.display_album_tracks_by_key(self.browsing_album_key)
-        self._refresh_playlist_detail_if_open(playlist_id)
+        self._refresh_playlist_detail_if_open(self._playlist_key(playlist_id))
 
     # Custom cover images are re-encoded down to this max dimension before
     # being stored (see set_playlist_cover_image) - a phone photo can
@@ -4675,7 +4925,7 @@ class AdaptiveMusicPlayer(QMainWindow):
         self.rebuild_playlist_grid()
         if self.browsing_album_key == self._playlist_key(playlist_id):
             self.display_album_tracks_by_key(self.browsing_album_key)
-        self._refresh_playlist_detail_if_open(playlist_id)
+        self._refresh_playlist_detail_if_open(self._playlist_key(playlist_id))
         self.status_label.setText(f"Updated cover for \u201c{record['name']}\u201d")
         self.status_label.setVisible(True)
 
@@ -4689,7 +4939,7 @@ class AdaptiveMusicPlayer(QMainWindow):
         self.rebuild_playlist_grid()
         if self.browsing_album_key == self._playlist_key(playlist_id):
             self.display_album_tracks_by_key(self.browsing_album_key)
-        self._refresh_playlist_detail_if_open(playlist_id)
+        self._refresh_playlist_detail_if_open(self._playlist_key(playlist_id))
 
     def refresh_replay_mix(self):
         # Deliberately track-level, not album-level - two favorite tracks
@@ -4930,8 +5180,14 @@ class AdaptiveMusicPlayer(QMainWindow):
                 # plays it (see handle_card_clicked/
                 # handle_card_double_clicked/_browse_to_track).
             else:
+                # entry["mode"] is "album" for both a real album and a
+                # Made For You mix (mode alone doesn't distinguish them -
+                # meta["is_mix"] below does), or "playlist" for a real
+                # user playlist - matters for right-click ("View Tracks"
+                # vs regular album actions) and keeps _refresh_now_playing_outlines'
+                # own mode check correct either way.
                 card = self._add_card(
-                    entry["album_key"], "album", meta["title"], meta["artist"], self._home_card_pixmap(meta),
+                    entry["album_key"], entry["mode"], meta["title"], meta["artist"], self._home_card_pixmap(meta),
                     target_grid=jump_grid, card_size=HOME_CARD_SIZE, is_mix=meta.get("is_mix", False),
                 )
                 # Double-click to play here, same as Library - see the
@@ -5782,6 +6038,7 @@ class AdaptiveMusicPlayer(QMainWindow):
             return
         self.browsing_album_key = target_key
         self.browsing_tracks = new_tracks
+        self.set_browsing_selection(target_key)
         self._start_playing_browsed_album()
         self.current_track_index = new_tracks.index(track_path)
 
@@ -5820,6 +6077,21 @@ class AdaptiveMusicPlayer(QMainWindow):
         current_path = None
         if 0 <= self.current_track_index < len(self.active_playing_tracks):
             current_path = self.active_playing_tracks[self.current_track_index]
+
+        # If the currently playing track is already shown highlighted in
+        # the main track panel to the right (song_list_widget) - e.g. you
+        # clicked this exact Top Song and it's now sitting highlighted in
+        # its real album's/mix's own tracklist there - that panel is
+        # already the one clear "this is what's playing" indicator.
+        # Lighting up the same track a second time here just reads as two
+        # conflicting answers to "what's playing" instead of one, even
+        # though both would technically be correct. Only a Top Songs row
+        # still lights up when the panel ISN'T already showing that same
+        # track - e.g. you're still browsing some earlier album while a
+        # Top Song from elsewhere plays - where this is genuinely the
+        # only indicator around.
+        if current_path is not None and self._library_row_for_playing_track() != -1:
+            current_path = None
 
         target_row = None
         for i in range(self.artist_top_songs_rows_layout.count()):
@@ -6508,9 +6780,7 @@ class AdaptiveMusicPlayer(QMainWindow):
         self.playlist_detail_play_btn.setObjectName("PlaylistDetailPlayButton")
         self.playlist_detail_play_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.playlist_detail_play_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.playlist_detail_play_btn.clicked.connect(
-            lambda: self.play_playlist(self.playlist_detail_key) if self.playlist_detail_key else None
-        )
+        self.playlist_detail_play_btn.clicked.connect(self._handle_playlist_detail_play_button_clicked)
         play_row = QHBoxLayout()
         play_row.addWidget(self.playlist_detail_play_btn)
         play_row.addStretch(1)
@@ -6597,20 +6867,50 @@ class AdaptiveMusicPlayer(QMainWindow):
 
     def _refresh_playlist_detail_header(self):
         key = self.playlist_detail_key
-        if not key or not key.startswith(self.PLAYLIST_KEY_PREFIX):
-            return
-        playlist_id = key[len(self.PLAYLIST_KEY_PREFIX):]
-        record = self.user_playlists.get(playlist_id)
-        if not record:
+        is_playlist = bool(key) and key.startswith(self.PLAYLIST_KEY_PREFIX)
+        is_mix = bool(key) and key.startswith(self.MIX_KEY_PREFIX)
+        if not is_playlist and not is_mix:
             return
 
-        self.playlist_detail_cover.setPixmap(self._playlist_hero_cover_pixmap(playlist_id, record))
-        self.playlist_detail_title.setText(record.get("name", "Untitled Playlist"))
+        if is_playlist:
+            playlist_id = key[len(self.PLAYLIST_KEY_PREFIX):]
+            record = self.user_playlists.get(playlist_id)
+            if not record:
+                return
+            self.playlist_detail_cover.setPixmap(self._playlist_hero_cover_pixmap(playlist_id, record))
+            self.playlist_detail_title.setText(record.get("name", "Untitled Playlist"))
+            track_paths = record.get("track_paths", [])
+            kind_label = "Playlist"
+        else:
+            meta = self.album_display_meta.get(key)
+            if not meta:
+                return
+            # Regenerated fresh at hero size rather than reused straight
+            # off meta["pixmap"] - that one's decoded/sized for a grid
+            # card, not this much bigger cover slot (same reasoning as
+            # _playlist_hero_cover_pixmap for a real playlist's cover).
+            self.playlist_detail_cover.setPixmap(
+                self.generate_mix_cover_pixmap(style=meta.get("mix_style", "replay"), size=160, radius=16)
+            )
+            self.playlist_detail_title.setText(meta.get("title", "Mix"))
+            track_paths = self.album_tracks.get(key, [])
+            kind_label = "Mix"
 
-        track_paths = record.get("track_paths", [])
+        # Rename-by-click and the "..." menu (Rename/Set Cover/Delete) are
+        # playlist-only concepts - a smart mix's name and cover are
+        # generated, and "deleting" one isn't a thing the way it is for
+        # something someone actually made (see _rename_playlist_detail/
+        # show_playlist_detail_menu, which already no-op for a mix key -
+        # this just stops them from looking clickable in the first place).
+        self.playlist_detail_title.setCursor(
+            Qt.CursorShape.PointingHandCursor if is_playlist else Qt.CursorShape.ArrowCursor
+        )
+        self.playlist_detail_title.setToolTip("Click to rename" if is_playlist else "")
+        self.playlist_detail_menu_btn.setVisible(is_playlist)
+
         count = len(track_paths)
         track_word = "track" if count == 1 else "tracks"
-        subtitle = f"Playlist \u2022 {count} {track_word}"
+        subtitle = f"{kind_label} \u2022 {count} {track_word}"
         if track_paths:
             total_ms = sum(self._track_duration_ms(p) for p in track_paths)
             if total_ms > 0:
@@ -6653,6 +6953,42 @@ class AdaptiveMusicPlayer(QMainWindow):
         is_active = key is not None and key == self.active_playing_album_key
         target_row = self.current_track_index if is_active else -1
         self.playlist_detail_list.set_now_playing_row(target_row, animate=animate)
+        self._refresh_playlist_detail_play_button()
+
+    def _refresh_playlist_detail_play_button(self):
+        # Three states: "Playing" while this exact playlist is the one
+        # actually playing right now (same note-glyph convention
+        # PlaylistTrackRowWidget's own now-playing rows use elsewhere in
+        # this view), "Paused" while it's still the active context but
+        # playback is paused rather than stopped, and plain "Play" the
+        # rest of the time - playback moved to something else entirely
+        # (a different playlist, an album, a mix...), or nothing's
+        # playing at all.
+        if not hasattr(self, "playlist_detail_play_btn"):
+            return
+        is_active = self.playlist_detail_key is not None and self.playlist_detail_key == self.active_playing_album_key
+        if is_active and self.is_playing:
+            text = "\u266A  Playing"
+        elif is_active:
+            text = "\u23F8  Paused"
+        else:
+            text = "\u25B6  Play"
+        self.playlist_detail_play_btn.setText(text)
+
+    def _handle_playlist_detail_play_button_clicked(self):
+        # While this playlist is already the active context (whether
+        # actually playing or just paused), the button's job is to
+        # resume/pause it in place, matching what "Playing"/"Paused"
+        # actually promise - restarting from track 0 every time you
+        # only meant to un-pause would undo wherever you actually were.
+        # play_playlist() (start over from track 0) is reserved for
+        # when playback isn't already here at all.
+        if not self.playlist_detail_key:
+            return
+        if self.playlist_detail_key == self.active_playing_album_key:
+            self.toggle_play()
+        else:
+            self.play_playlist(self.playlist_detail_key)
 
     def _play_playlist_detail_item(self, item: QListWidgetItem):
         row = self.playlist_detail_list.row(item)
@@ -6685,6 +7021,11 @@ class AdaptiveMusicPlayer(QMainWindow):
                 lambda checked=False, pid=playlist_id, r=row: self.remove_track_from_playlist_at(pid, r)
             )
             menu.addAction(remove_action)
+        # Deliberately no "Remove from Mix" for a __mix__ key here - the
+        # Made For You mixes are algorithmically generated, not something
+        # a person edits track-by-track, so this view is read-only for
+        # them (see _add_queue_and_playlist_actions for the matching "no
+        # Add to Mix" side of the same rule).
 
         menu.exec(self.playlist_detail_list.viewport().mapToGlobal(pos))
 
@@ -6724,12 +7065,14 @@ class AdaptiveMusicPlayer(QMainWindow):
 
         menu.exec(self.playlist_detail_menu_btn.mapToGlobal(QPoint(0, self.playlist_detail_menu_btn.height())))
 
-    def _refresh_playlist_detail_if_open(self, playlist_id: str):
+    def _refresh_playlist_detail_if_open(self, key: str):
         # Called after any edit that could change what this view is
         # showing (rename, cover change, tracks added/removed) - a no-op
         # unless that specific playlist happens to be the one currently
-        # open here.
-        if self.playlist_detail_key == self._playlist_key(playlist_id):
+        # open here. Only ever a real playlist's key in practice now that
+        # mixes are read-only, but takes any key generically since
+        # nothing about it actually depends on that.
+        if self.playlist_detail_key == key:
             self._refresh_playlist_detail_header()
             self._refresh_playlist_detail_list()
 
@@ -6923,7 +7266,56 @@ class AdaptiveMusicPlayer(QMainWindow):
         return bottom_panel
 
     # ------------------------------------------------------------- Theme --
+    def _crossfade_window(self, duration: int = 260):
+        # Grabs what's on screen right now and shows it as a still
+        # overlay covering the whole window, then lets whatever's about
+        # to change happen instantly underneath - invisible for a moment
+        # since the snapshot is covering it - then fades that still away
+        # to reveal it. Whatever the actual change is stays exactly as
+        # cheap as it already was (one setStyleSheet call, one grid
+        # rebuild - not something animated frame-by-frame); only this
+        # crossfade itself is animated. Used for the theme's color change
+        # (see _begin_theme_fade/apply_theme) and for leaving the artist-
+        # detail view back to a plain Library grid (see
+        # switch_top_level_tab) - both cases where the page/view_stack
+        # index isn't actually changing (so FadingStackedWidget's own
+        # crossfade never kicks in) but the visible content very much is.
+        #
+        # Skipped whenever the window isn't visible yet (grabbing it
+        # would just capture blank/garbage pixels) and while a fade's
+        # already mid-flight (a rapid track skip, or clicking around
+        # quickly) rather than stacking one snapshot on top of another
+        # mid-transition.
+        if not self.isVisible():
+            return
+        if self._theme_fade_anim is not None and self._theme_fade_anim.state() == QPropertyAnimation.State.Running:
+            return
+
+        self._theme_fade_overlay.setGeometry(self.rect())
+        self._theme_fade_overlay.setPixmap(self.grab())
+        self._theme_fade_opacity_effect.setOpacity(1.0)
+        self._theme_fade_overlay.show()
+        self._theme_fade_overlay.raise_()
+
+        anim = QPropertyAnimation(self._theme_fade_opacity_effect, b"opacity", self)
+        anim.setDuration(duration)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        anim.setStartValue(1.0)
+        anim.setEndValue(0.0)
+        anim.finished.connect(self._theme_fade_overlay.hide)
+        self._theme_fade_anim = anim
+        anim.start()
+
+    def _begin_theme_fade(self):
+        # Skipped on the very first call (see _theme_initialized - that
+        # one's just the startup default, nothing real to fade from).
+        if not self._theme_initialized:
+            self._theme_initialized = True
+            return
+        self._crossfade_window()
+
     def apply_theme(self, base_color: QColor):
+        self._begin_theme_fade()
         bg_hex = base_color.name()
         panel_bg = "rgba(255, 255, 255, 0.04)"
         panel_hover = "rgba(255, 255, 255, 0.08)"
@@ -7468,7 +7860,22 @@ class AdaptiveMusicPlayer(QMainWindow):
         painter.setPen(QColor(255, 255, 255, 210))
         font = QFont("SF Pro Text", int(size * 0.4), QFont.Weight.Bold)
         painter.setFont(font)
-        painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, glyph)
+        # AlignCenter alone only centers the font's logical line-height
+        # box, not this specific glyph's actual visual ink - which for a
+        # symbol character like these is very often lopsided (extra
+        # descender space under a music note that isn't there for a sun,
+        # a crescent moon's ink sitting further to one side than a star's
+        # does, ...), so every icon ended up looking slightly - and each
+        # one differently - off-center depending on its own shape.
+        # tightBoundingRect gives the real painted-pixel extents for this
+        # exact glyph at this exact font, which then gets centered
+        # against the actual tile by hand instead of trusting the font's
+        # own (glyph-agnostic) metrics to already be centered.
+        metrics = QFontMetrics(font)
+        ink_rect = metrics.tightBoundingRect(glyph)
+        x = (size - ink_rect.width()) / 2 - ink_rect.left()
+        y = (size - ink_rect.height()) / 2 - ink_rect.top()
+        painter.drawText(QPointF(x, y), glyph)
         painter.end()
         return self.make_pixmap_rounded(pixmap, radius=radius)
 
@@ -7814,10 +8221,19 @@ class AdaptiveMusicPlayer(QMainWindow):
         self._refresh_now_playing_outlines(force=True)
 
     def show_album_card_context_menu(self, card: AlbumCardWidget):
-        # Playlist tiles (card.mode == "playlist") are handled entirely by
-        # their own show_playlist_card_context_menu instead - they're
-        # never routed through here, since they need Rename/Delete rather
-        # than Pin/Unpin.
+        # Playlist tiles on their own Playlists grid are wired straight
+        # to show_playlist_card_context_menu and never reach here at all
+        # (see rebuild_playlist_grid) - but a playlist card can also show
+        # up somewhere else entirely now (Jump Back In - see
+        # get_jump_back_in_entries), built through the ordinary _add_card
+        # path that wires every card's right-click to this generic
+        # handler. That function only ever needed card.mode/album_key to
+        # begin with, so it works unchanged for a playlist card found
+        # here too - just delegate to it rather than duplicating Rename/
+        # Set Cover/Delete/View Tracks a second time.
+        if card.mode == "playlist":
+            self.show_playlist_card_context_menu(card)
+            return
         if card.mode == "album":
             if not card.album_key or card.album_key.startswith("__mix__"):
                 return  # a smart mix's tile isn't pinnable/queueable as "an album"
@@ -7844,7 +8260,14 @@ class AdaptiveMusicPlayer(QMainWindow):
         # song_list_widget rows) - "Play Next"/"Add to Queue" for the
         # session-only play queue, plus an "Add to Playlist" submenu
         # listing every saved playlist and a "New Playlist..." shortcut
-        # that creates one already containing these tracks.
+        # that creates one already containing these tracks. Deliberately
+        # no equivalent "Add to Mix" here - the Made For You mixes
+        # (Replay Mix, Night Owl, ...) are algorithmically generated, not
+        # something a person builds track-by-track the way a real
+        # playlist is, so there's no add/remove entry point for them
+        # anywhere (see _show_playlist_detail_context_menu, which
+        # likewise only offers "Remove from Playlist" for a real
+        # playlist's own key).
         if not track_paths:
             return
 
@@ -7982,6 +8405,25 @@ class AdaptiveMusicPlayer(QMainWindow):
         # outlines at once" bug - see _add_card's own registration
         # comment for the first version of it; this removes the whole
         # class rather than patching another specific cause of it.
+        #
+        # A playlist/mix's own card is meant to be the one clear "this is
+        # what's playing" indicator whenever that's the context playback
+        # actually started from - a "track" mode card elsewhere (Jump
+        # Back In, a search result, ...) that happens to be this exact
+        # same song stays dark rather than also lighting up right
+        # alongside it. Without this, playing a mix and then having Jump
+        # Back In gain a fresh entry for that same track ~30 seconds in
+        # (see _maybe_log_play/mark_home_shelves_dirty) made a second
+        # card suddenly light up too, which read as "now it's highlighted
+        # somewhere else" even though the mix's own card never actually
+        # lost its outline. Doesn't apply to a real album or the
+        # QUEUE_KEY context - there, a track card lighting up alongside
+        # its album is the only indicator that exact song is the one
+        # playing, not just some other track from that same album.
+        key = self.active_playing_album_key
+        is_playlist_or_mix_context = bool(key) and (
+            key.startswith(self.MIX_KEY_PREFIX) or key.startswith(self.PLAYLIST_KEY_PREFIX)
+        )
         matches = []
         for grid in self._all_grids_with_cards():
             for i in range(grid.count()):
@@ -7998,7 +8440,8 @@ class AdaptiveMusicPlayer(QMainWindow):
                 if (widget.mode in ("album", "playlist") and self.active_playing_album_key
                         and widget.album_key == self.active_playing_album_key):
                     is_match = True
-                elif widget.mode == "track" and current_track_path is not None and widget.track_path == current_track_path:
+                elif (widget.mode == "track" and not is_playlist_or_mix_context
+                        and current_track_path is not None and widget.track_path == current_track_path):
                     is_match = True
                 else:
                     is_match = False
@@ -8038,17 +8481,34 @@ class AdaptiveMusicPlayer(QMainWindow):
         self.selected_cards = []
 
     def set_selected_card(self, card: AlbumCardWidget):
+        self.set_browsing_selection(card.album_key, extra_card=card)
+
+    def set_browsing_selection(self, album_key: Optional[str], extra_card: Optional[AlbumCardWidget] = None):
+        # Every place that changes what's being browsed funnels through
+        # here now (display_album_tracks_by_key, _browse_to_track,
+        # _resync_now_playing_top_song_context) - not just a direct click
+        # on the card itself. Without that, the selection ring only ever
+        # moved when you clicked an AlbumCardWidget directly; browsing in
+        # some other way (a Top Song, a search result, a smart card, the
+        # toggle between "Playing as Mix"/"Playing from Album"...) left
+        # whichever card was last actually clicked stuck ringed as
+        # "selected" forever, alongside whatever card was correctly
+        # ringed as "now playing" instead - two rings, for two different
+        # reasons neither of which was wrong on its own.
         self._clear_card_selection()
-        # Select every on-screen copy of this album together, not just
-        # the specific widget this call happened to be about - otherwise,
-        # for a pinned album, only one of its two copies ever lit up
-        # (whichever was created most recently), and since the pinned
-        # strip is the one place that's always on screen without
-        # scrolling, that made it look like the highlight was missing
-        # entirely even when the other copy still had it.
-        matches = self._cards_for_album(card.album_key) if card.album_key else []
-        if card not in matches:
-            matches.append(card)
+        # _cards_for_album finds every on-screen copy of this album
+        # together, not just one - otherwise, for a pinned album, only
+        # one of its two copies ever lit up (whichever was created most
+        # recently), and since the pinned strip is the one place that's
+        # always on screen without scrolling, that made it look like the
+        # selection was missing entirely even when the other copy still
+        # had it.
+        matches = self._cards_for_album(album_key) if album_key else []
+        # extra_card covers a direct click even in the unlikely case this
+        # card scan somehow doesn't turn up the exact widget that was
+        # clicked (a timing edge case, not the normal path).
+        if extra_card is not None and extra_card not in matches:
+            matches.append(extra_card)
         for widget in matches:
             widget.set_selected(True, self._current_accent)
         self.selected_cards = matches
@@ -8096,6 +8556,7 @@ class AdaptiveMusicPlayer(QMainWindow):
         # click/double-click to actually play.
         self.browsing_album_key = album_key
         self.browsing_tracks = self.album_tracks.get(album_key, [])
+        self.set_browsing_selection(album_key)
 
         meta = self.album_display_meta.get(album_key, {})
         self.album_heading.setText(f"{meta.get('title', '')} \u2014 {meta.get('artist', '')}")
@@ -8127,6 +8588,20 @@ class AdaptiveMusicPlayer(QMainWindow):
     def handle_card_double_clicked(self, card: AlbumCardWidget):
         if card.plays_immediately_on_click:
             return  # already started playing on the single click above
+        is_mix_card = card.mode == "album" and card.album_key and card.album_key.startswith(self.MIX_KEY_PREFIX)
+        if is_mix_card or card.mode == "playlist":
+            # A smart mix (Made For You, etc.) or a playlist card showing
+            # up somewhere other than its own Playlists grid (Jump Back
+            # In, say - see get_jump_back_in_entries) - double-click
+            # opens its own dedicated tracklist view instead of jumping
+            # straight into playback, the same treatment a playlist's
+            # card on its own grid already gets (see
+            # handle_playlist_card_clicked) rather than the "double-click
+            # plays immediately" convention a real album's card keeps.
+            # The Play button inside that view still starts it playing,
+            # same as a playlist's own.
+            self.open_playlist_detail_view(card.album_key)
+            return
         self._play_card(card)
 
 # ------------------------------------------------------------- Track panel --
@@ -8154,6 +8629,7 @@ class AdaptiveMusicPlayer(QMainWindow):
         self.song_list_widget.clear()
         self.browsing_album_key = key
         self.browsing_tracks = self.album_tracks.get(key, [])
+        self.set_browsing_selection(key)
 
         meta = self.album_display_meta.get(key, {})
         self.album_heading.setText(f"{meta.get('title', '')} \u2014 {meta.get('artist', '')}")
@@ -8498,6 +8974,7 @@ class AdaptiveMusicPlayer(QMainWindow):
             else:
                 self.play_btn.set_playing(False)
                 self.is_playing = False
+                self._refresh_playlist_detail_play_button()
                 self._mpris_notify({"PlaybackStatus": "Stopped"})
                 if HAS_DBUS_PYTHON:
                     self._mpris_position_timer.stop()
@@ -9048,7 +9525,17 @@ class AdaptiveMusicPlayer(QMainWindow):
         # path that genuinely isn't in the scanned library (shouldn't
         # normally happen, but better to log something than nothing).
         real_album_key = self.track_to_album_key.get(path, self.active_playing_album_key)
-        self._log_play(path, real_album_key)
+        # Separately, also records the *context* this play actually came
+        # through (a Made For You mix, a playlist, or a real album/
+        # QUEUE_KEY - whatever active_playing_album_key genuinely is) -
+        # kept apart from real_album_key so nothing about Recently
+        # Played/Most Played/Jump Back In's own album-and-track logic
+        # above changes, but Jump Back In can additionally recognize
+        # "you've been listening to this mix/playlist a lot itself" (see
+        # get_jump_back_in_entries) - something the real-album
+        # attribution alone can't ever show, since a mix's whole point is
+        # drawing from many different albums at once.
+        self._log_play(path, real_album_key, context_key=self.active_playing_album_key)
         # mark_home_shelves_dirty() otherwise only ever actually recomputes
         # anything on startup, on switching to the Home tab, or on
         # pinning/unpinning an album - nothing previously re-rendered Jump
@@ -9064,8 +9551,16 @@ class AdaptiveMusicPlayer(QMainWindow):
         # right now anyway.
         self.mark_home_shelves_dirty()
 
-    def _log_play(self, path: str, album_key: Optional[str]):
+    def _log_play(self, path: str, album_key: Optional[str], context_key: Optional[str] = None):
         record = {"ts": int(time.time()), "path": path, "album_key": album_key}
+        if context_key and context_key != album_key:
+            # Only stored when it actually adds information - a play
+            # started directly from its own real album already has
+            # context_key == album_key, so omitting it there keeps the
+            # vast majority of records exactly as small as they always
+            # were. See get_jump_back_in_entries for the one thing that
+            # reads this back out.
+            record["context_key"] = context_key
         try:
             with open(self._play_history_path(), "a", encoding="utf-8") as f:
                 f.write(json.dumps(record) + "\n")
@@ -10027,6 +10522,7 @@ class AdaptiveMusicPlayer(QMainWindow):
                     print(f"[Chromecast] play() raised: {e}")  # Debug
 
         self.is_playing = not self.is_playing
+        self._refresh_playlist_detail_play_button()
 
     def cycle_playback_mode(self):
         # 0 = off, 1 = repeat playlist, 2 = repeat song, 3 = shuffle
