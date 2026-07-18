@@ -7345,6 +7345,13 @@ class AdaptiveMusicPlayer(QMainWindow):
 
         self.setStyleSheet(f"""
             QMainWindow {{ background-color: {bg_hex}; }}
+            /* QScrollArea (Library/Playlists/Artists page wrappers) has no
+               color of its own - without this, its viewport paints an
+               opaque background from the palette instead of letting this
+               dynamic per-track theme color show through underneath the
+               semi-transparent widgets (e.g. QListWidget#AlbumGrid) it
+               contains. */
+            QScrollArea, QScrollArea > QWidget > QWidget {{ background: transparent; border: none; }}
 
             QWidget#CustomTitleBar {{
                 background-color: rgba(255, 255, 255, 0.03);
@@ -11279,14 +11286,27 @@ if __name__ == "__main__":
     # at the OS/desktop level (common on many Arch+KDE setups via qt6ct or
     # Breeze integration) purely by coincidence - and plain white on any
     # system without one, since the app itself never actually set its own
-    # palette. Setting it explicitly here removes that dependency on the
-    # user's system Qt config entirely.
-    dark_base = QColor(18, 20, 24)  # same default apply_theme() starts with
+    # palette.
+    #
+    # This has to be *transparent*, not a solid dark color - an opaque
+    # fallback here sits as an extra layer between the QMainWindow's
+    # dynamic per-track theme color (set in apply_theme()) and widgets
+    # like QListWidget#AlbumGrid that are deliberately semi-transparent so
+    # they blend with whatever's playing. A solid color here would block
+    # that blend and flatten everything to one static shade instead -
+    # this is only meant to stop the OS's own default (often plain white)
+    # from showing through on systems without a dark Qt palette already
+    # configured, not to introduce a competing color of its own.
+    transparent = QColor(0, 0, 0, 0)
     dark_palette = QPalette()
     for role in (QPalette.ColorRole.Window, QPalette.ColorRole.Base,
-                 QPalette.ColorRole.AlternateBase, QPalette.ColorRole.Button,
-                 QPalette.ColorRole.ToolTipBase):
-        dark_palette.setColor(role, dark_base)
+                 QPalette.ColorRole.AlternateBase, QPalette.ColorRole.Button):
+        dark_palette.setColor(role, transparent)
+    # Tooltips are an exception - floating popups that render over
+    # whatever's on the desktop behind them, not over the rest of this
+    # app's own painted layers, so they need to stay genuinely opaque to
+    # be readable.
+    dark_palette.setColor(QPalette.ColorRole.ToolTipBase, QColor(18, 20, 24))
     for role in (QPalette.ColorRole.WindowText, QPalette.ColorRole.Text,
                  QPalette.ColorRole.ButtonText, QPalette.ColorRole.ToolTipText):
         dark_palette.setColor(role, QColor(255, 255, 255))
