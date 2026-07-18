@@ -10931,6 +10931,15 @@ class AdaptiveMusicPlayer(QMainWindow):
         self._mpris_position_timer.timeout.connect(self._mpris_push_position)
 
     def mpris_metadata(self) -> dict:
+        # Every call site does self._mpris_notify({"Metadata": self.mpris_metadata(), ...}) -
+        # Python evaluates this method's return value before _mpris_notify() ever runs,
+        # so _mpris_notify()'s own "if not HAS_DBUS_PYTHON: return" guard is too late to
+        # help here. Without this check, the dbus.ObjectPath/String/etc calls below crash
+        # with NameError on any system without dbus-python installed - which the README
+        # documents as optional - the instant anyone presses play.
+        if not HAS_DBUS_PYTHON:
+            return {}
+
         if not (0 <= self.current_track_index < len(self.active_playing_tracks)):
             return {}
 
