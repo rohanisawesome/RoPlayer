@@ -76,6 +76,18 @@ except ImportError:
 import pychromecast
 from pychromecast.controllers.media import MediaController
 
+# "SF Pro Text" is Apple's system font and isn't freely distributable, so it's
+# essentially never actually installed on Linux - every QFont() call below asks
+# for it first (so it's used if someone genuinely has it) but falls through to
+# Inter, then Noto Sans, then whatever generic sans-serif fontconfig resolves
+# to, rather than an uncontrolled arbitrary substitution. All the UI's spacing/
+# sizing math was tuned against SF Pro Text's metrics, so this doesn't
+# guarantee pixel-identical layout on every system, but it keeps every font
+# in the fallback chain visually close enough that things stay readable and
+# roughly aligned instead of overflowing/misaligning like a random fallback
+# font can.
+UI_FONT_FAMILIES = ["SF Pro Text", "Inter", "Noto Sans", "sans-serif"]
+
 SUPPORTED_EXTENSIONS = {".mp3", ".flac", ".m4a", ".mp4", ".ogg", ".oga", ".wav", ".wma", ".aac"}
 COVER_SIZE = 125
 CARD_SIZE = QSize(139, 207)  # +16px over the original 191 - room for a title to wrap to 2 lines
@@ -1851,7 +1863,7 @@ class LyricsListWidget(ControlledScrollListWidget):
         if available <= 0:
             return
 
-        unit = QFontMetrics(QFont("SF Pro Text", 16, QFont.Weight.Medium)).height() + 12  # matches ::item margin-bottom
+        unit = QFontMetrics(QFont(UI_FONT_FAMILIES, 16, QFont.Weight.Medium)).height() + 12  # matches ::item margin-bottom
         if unit <= 0:
             return
 
@@ -2159,14 +2171,14 @@ class AlbumCardWidget(QWidget):
         # every title/artist label larger than intended, which is why
         # Library's wrapping broke too even though nothing about its own
         # sizing was supposed to change.
-        title_font = QFont("SF Pro Text")
+        title_font = QFont(UI_FONT_FAMILIES)
         title_font.setPixelSize(title_font_px)
         title_font.setWeight(QFont.Weight.Bold)
         title_style = "color: #FFFFFF; background: transparent;"
         title_viewport, self.title_lbl = self._make_title_label(title, title_style, text_viewport_width, title_font)
         layout.addWidget(title_viewport, alignment=Qt.AlignmentFlag.AlignHCenter)
 
-        artist_font = QFont("SF Pro Text")
+        artist_font = QFont(UI_FONT_FAMILIES)
         artist_font.setPixelSize(artist_font_px)
         artist_font.setWeight(QFont.Weight.Normal)
         subtitle_style = "color: rgba(255,255,255,0.5); background: transparent;"
@@ -2202,7 +2214,7 @@ class AlbumCardWidget(QWidget):
         self._trending_badge = QLabel("\U0001F525", self)
         self._trending_badge.setObjectName("TrendingBadge")
         self._trending_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        trending_font = QFont("SF Pro Text")
+        trending_font = QFont(UI_FONT_FAMILIES)
         trending_badge_px = max(16, round(20 * scale))
         trending_font.setPixelSize(trending_badge_px)
         self._trending_badge.setFont(trending_font)
@@ -6128,7 +6140,7 @@ class AdaptiveMusicPlayer(QMainWindow):
         painter.setBrush(gradient)
         painter.drawRect(0, 0, size, size)
         painter.setPen(QColor(255, 255, 255, 225))
-        font = QFont("SF Pro Text", int(size * 0.38), QFont.Weight.Bold)
+        font = QFont(UI_FONT_FAMILIES, int(size * 0.38), QFont.Weight.Bold)
         painter.setFont(font)
         initial = (name.strip()[:1] or "?").upper()
         painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, initial)
@@ -7486,7 +7498,7 @@ class AdaptiveMusicPlayer(QMainWindow):
             QMenu::item {{ color: #FFFFFF; padding: 6px 20px; border-radius: 4px; }}
             QMenu::item:selected {{ background-color: rgba(255,255,255,0.1); }}
             
-            QLabel {{ color: #FFFFFF; font-family: 'SF Pro Text', -apple-system, BlinkMacSystemFont, sans-serif; }}
+            QLabel {{ color: #FFFFFF; font-family: 'SF Pro Text', 'Inter', 'Noto Sans', sans-serif; }}
             QLabel#AlbumHeading {{ font-size: 14px; font-weight: 700; padding: 2px 4px 8px 4px; color: rgba(255,255,255,0.9); }}
             QLabel#StatusLabel {{ font-size: 12px; color: rgba(255,255,255,0.6); padding: 2px 4px; }}
             QLabel#TimeLabel {{ color: rgba(255, 255, 255, 0.6); font-size: 11px; font-weight: 600; }}
@@ -7858,7 +7870,7 @@ class AdaptiveMusicPlayer(QMainWindow):
         gradient.setColorAt(1.0, color_b)
         painter.fillRect(0, 0, size, size, gradient)
         painter.setPen(QColor(255, 255, 255, 210))
-        font = QFont("SF Pro Text", int(size * 0.4), QFont.Weight.Bold)
+        font = QFont(UI_FONT_FAMILIES, int(size * 0.4), QFont.Weight.Bold)
         painter.setFont(font)
         # AlignCenter alone only centers the font's logical line-height
         # box, not this specific glyph's actual visual ink - which for a
@@ -10142,7 +10154,7 @@ class AdaptiveMusicPlayer(QMainWindow):
         # ever gets, once it becomes the highlighted/active line - not
         # the resting 16px size, so a line that fits while dim doesn't
         # overflow the moment it becomes active and grows.
-        metrics = QFontMetrics(QFont("SF Pro Text", 19, QFont.Weight.Bold))
+        metrics = QFontMetrics(QFont(UI_FONT_FAMILIES, 19, QFont.Weight.Bold))
 
         if metrics.horizontalAdvance(text) <= max_width:
             return text  # fits on one line
@@ -10256,10 +10268,10 @@ class AdaptiveMusicPlayer(QMainWindow):
             item = QListWidgetItem(wrapped_text)
             item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             if self._lyrics_have_real_data:
-                item.setFont(QFont("SF Pro Text", 16, QFont.Weight.Medium))
+                item.setFont(QFont(UI_FONT_FAMILIES, 16, QFont.Weight.Medium))
                 item.setForeground(QColor(255, 255, 255, 80))
             else:
-                item.setFont(QFont("SF Pro Text", 16, QFont.Weight.Bold))
+                item.setFont(QFont(UI_FONT_FAMILIES, 16, QFont.Weight.Bold))
                 item.setForeground(QColor(255, 255, 255, 255))
             self.lyrics_box.addItem(item)
 
@@ -10298,7 +10310,7 @@ class AdaptiveMusicPlayer(QMainWindow):
             # lyrics view opens already knowing which line is active (see
             # _populate_lyrics_content), so it doesn't replay a transition
             # that effectively already happened while the view was closed.
-            item.setFont(QFont("SF Pro Text", round(end_size), weight))
+            item.setFont(QFont(UI_FONT_FAMILIES, round(end_size), weight))
             item.setForeground(QColor(255, 255, 255, end_alpha))
             self.lyric_item_anims.pop(index, None)
             return
@@ -10313,7 +10325,7 @@ class AdaptiveMusicPlayer(QMainWindow):
                    start_alpha=start_alpha, end_alpha=end_alpha, weight=weight):
             size = start_size + (end_size - start_size) * t
             alpha = int(start_alpha + (end_alpha - start_alpha) * t)
-            item.setFont(QFont("SF Pro Text", round(size), weight))
+            item.setFont(QFont(UI_FONT_FAMILIES, round(size), weight))
             item.setForeground(QColor(255, 255, 255, alpha))
 
         anim.valueChanged.connect(_apply)
