@@ -15,21 +15,31 @@ Auto-generated, YouTube Music-style shelves built entirely from your own local l
 - **Album Rewind** — whole albums you used to spin and have since stopped
 - **Month Rewind** — your top tracks from a specific past month
 
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/d96105d7-15c2-41fb-95b9-46ba601cd2a6" />
+
 ### Library
 
 Recursively scans a folder of local audio files — `.mp3`, `.flac`, `.m4a`, `.mp4`, `.ogg`, `.oga`, `.wav`, `.wma`, `.aac` — grouping tracks into albums by folder and tag metadata, with cover art and metadata pulled straight from your files via Mutagen. Pin favorite albums to keep them anchored at the front of the grid regardless of sort order, and use the search bar (3+ characters) for instant filtering across your whole collection.
+
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/fdaed95e-41ad-414e-a0ba-49ebc7b6db7c" />
 
 ### Artists View
 
 Dedicated pages per artist, pulling public bio text, listener counts, and play counts straight from Last.fm's read-only artist API (no login needed for this part), plus artist photos, top tracks — cross-referenced against your own library so anything you actually own is playable straight from the list — and top albums ranked by Last.fm listener count.
 
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/b40b1812-6a39-43fc-a651-9ff8fa019bc6" />
+
 ### Playlists
 
 Build your own playlists from any tracks in your library: add and remove tracks, reorder, rename, delete, and set a custom cover image per playlist, independent of whatever art the tracks themselves carry.
 
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/3ade342e-442f-4d81-bafe-44beddc72b4d" />
+
 ### Lyrics
 
 A dedicated full-screen panel that follows along as a track plays. RoPlayer reads lyrics from a `.lrc` or `.txt` file sitting next to the audio file itself (same filename, different extension) — a `.lrc` with timestamps gets line-by-line synced highlighting, while a plain `.txt` just displays as static lyrics. Lyrics aren't fetched from the internet automatically, so you'll need to supply your own files for a track to show anything beyond "Lyrics not available."
+
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/245ad591-8d65-4eb7-951f-c4295ad71c52" />
 
 ### Playback
 
