@@ -11250,6 +11250,16 @@ class LibraryScanner(QThread):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    # Force Qt's own built-in style rather than whatever native/GTK style
+    # this platform would otherwise auto-select. Some style engines (GTK
+    # integration in particular, common on setups without a Qt-native
+    # desktop environment) don't fully honor custom stylesheets - most
+    # visibly, QMainWindow's background-color rule can be silently
+    # ignored, leaving the base window white even though every other
+    # widget's hardcoded colors render fine. Fusion is platform-
+    # independent and guaranteed to render this stylesheet identically
+    # everywhere.
+    app.setStyle("Fusion")
     # Run directly from a terminal (python player.py) rather than via an
     # installed launcher, so Qt has no automatic way to know this process
     # corresponds to roplayer.desktop. Several desktop-integration features
