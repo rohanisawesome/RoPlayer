@@ -1,5 +1,5 @@
 pkgname=my-music-player
-pkgver=1.1.6
+pkgver=1.0.0
 pkgrel=1
 pkgdesc="My custom Python music player"
 arch=('any')
