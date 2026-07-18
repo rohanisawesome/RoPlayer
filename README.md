@@ -26,7 +26,13 @@ A desktop music player for Linux, built with PyQt6. Point it at a folder of loca
 
 ### Arch Linux
 
-A `PKGBUILD` is included and pulls in every dependency (including the Qt6 multimedia backend) automatically:
+**Via the AUR (recommended)** — installs like a normal package and shows up in future `yay -Syu` / `paru -Syu` runs:
+
+```bash
+yay -S roplayer
+```
+
+**From source** — useful if you want to build an unreleased change before it's tagged:
 
 ```bash
 git clone https://github.com/rohanisawesome/RoPlayer.git
@@ -68,8 +74,8 @@ plays:
 - **Fedora**: `sudo dnf install qt6-qtmultimedia ffmpeg`
 
 This is a known Linux-specific PyQt6 packaging quirk, not something specific
-to RoPlayer — the Arch package above avoids it entirely since `makepkg -si`
-pulls the backend in as a dependency.
+to RoPlayer — either Arch install path above avoids it entirely, since the
+backend comes in automatically as a dependency either way.
 
 ## Usage
 
