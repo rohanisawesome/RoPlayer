@@ -128,7 +128,7 @@ ARTIST_STATS_MAX_AGE_SECONDS = 1 * 86400
 ARTIST_BIO_MAX_AGE_SECONDS = 90 * 86400
 ORG_NAME = "RoPlayer"
 APP_NAME = "RoPlayer"
-APP_VERSION = "1.1.11"
+APP_VERSION = "1.1.12"
 APP_REPO_URL = "https://github.com/rohanisawesome/RoPlayer"
 
 # --------------------------------------------------------------------------
@@ -11281,48 +11281,93 @@ class AdaptiveMusicPlayer(QMainWindow):
             def log_message(self, format, *args):
                 pass  # keep the console output clean
 
-            def do_GET(self):
-                # http.server.SimpleHTTPRequestHandler ignores the Range
-                # header entirely and always serves the whole file from
-                # byte 0. That breaks casting mid-track: the Chromecast
-                # requests "bytes=START-" to seek to a position, gets the
-                # full file instead, and resets the connection because the
-                # data it received doesn't match what it asked for. Handle
-                # Range ourselves with a real 206 Partial Content response.
-                range_header = self.headers.get('Range')
-                file_path = self.translate_path(self.path)
-
-                if not range_header or not os.path.isfile(file_path):
-                    try:
-                        return super().do_GET()
-                    except (BrokenPipeError, ConnectionResetError):
-                        return  # client (Chromecast) closed the connection early - not an error
-
+            @staticmethod
+            def _audio_start_offset(file_path):
+                # Byte offset where the actual audio begins. An MP3's ID3v2
+                # tag block (title, lyrics and, above all, embedded cover
+                # art) sits in front of the audio, and Google cast speakers
+                # stall ~5s on files with embedded art before they start
+                # playing - measured on a Nest speaker: 5.2s with the art,
+                # 0.3s with the same file's tag block skipped. The speaker
+                # gets title/artist/album from play_media()'s metadata
+                # anyway, so serve it just the audio. The file on disk is
+                # never modified.
+                if not file_path.lower().endswith('.mp3'):
+                    return 0
+                offset = 0
                 try:
-                    file_size = os.path.getsize(file_path)
-                    units, _, range_spec = range_header.partition('=')
-                    if units.strip() != 'bytes':
-                        raise ValueError
-                    start_str, _, end_str = range_spec.partition('-')
-                    start = int(start_str) if start_str else 0
-                    end = int(end_str) if end_str else file_size - 1
-                    end = min(end, file_size - 1)
-                    if start < 0 or start > end:
-                        raise ValueError
-                except (ValueError, OSError):
-                    self.send_error(416, "Requested Range Not Satisfiable")
+                    with open(file_path, 'rb') as f:
+                        while True:  # rarely, several tags back to back
+                            f.seek(offset)
+                            header = f.read(10)
+                            if len(header) < 10 or header[:3] != b'ID3':
+                                break
+                            size = ((header[6] & 0x7f) << 21) | ((header[7] & 0x7f) << 14) \
+                                | ((header[8] & 0x7f) << 7) | (header[9] & 0x7f)
+                            offset += 10 + size + (10 if header[5] & 0x10 else 0)
+                except OSError:
+                    return 0
+                return offset
+
+            def do_HEAD(self):
+                self._serve(send_body=False)
+
+            def do_GET(self):
+                self._serve(send_body=True)
+
+            def _serve(self, send_body):
+                # Handles every request itself (not SimpleHTTPRequestHandler's
+                # own do_GET), so Range requests get real 206 responses -
+                # needed for the speaker to seek/resume mid-track - and so
+                # the served bytes can start after the ID3 tag (see
+                # _audio_start_offset). Byte positions below are within
+                # that served audio, not the file on disk.
+                file_path = self.translate_path(self.path)
+                if not os.path.isfile(file_path):
+                    self.send_error(404, "File not found")
+                    return
+                try:
+                    offset = self._audio_start_offset(file_path)
+                    total = max(0, os.path.getsize(file_path) - offset)
+                except OSError:
+                    self.send_error(404, "File not found")
                     return
 
+                range_header = self.headers.get('Range')
+                start, end = 0, total - 1
+                if range_header:
+                    try:
+                        units, _, range_spec = range_header.partition('=')
+                        if units.strip() != 'bytes':
+                            raise ValueError
+                        start_str, _, end_str = range_spec.partition('-')
+                        if start_str:
+                            start = int(start_str)
+                            end = min(int(end_str), total - 1) if end_str else total - 1
+                        else:  # "bytes=-N": the last N bytes
+                            start = max(0, total - int(end_str))
+                        if start < 0 or start > end:
+                            raise ValueError
+                    except ValueError:
+                        self.send_response(416)
+                        self.send_header('Content-Range', f'bytes */{total}')
+                        self.send_header('Content-Length', '0')
+                        self.end_headers()
+                        return
+
                 length = end - start + 1
-                self.send_response(206)
+                self.send_response(206 if range_header else 200)
                 self.send_header('Content-Type', self.guess_type(file_path))
                 self.send_header('Content-Length', str(length))
-                self.send_header('Content-Range', f'bytes {start}-{end}/{file_size}')
+                if range_header:
+                    self.send_header('Content-Range', f'bytes {start}-{end}/{total}')
                 self.end_headers()
+                if not send_body:
+                    return
 
                 try:
                     with open(file_path, 'rb') as f:
-                        f.seek(start)
+                        f.seek(offset + start)
                         remaining = length
                         chunk_size = 64 * 1024
                         while remaining > 0:
