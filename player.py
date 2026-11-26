@@ -128,7 +128,7 @@ ARTIST_STATS_MAX_AGE_SECONDS = 1 * 86400
 ARTIST_BIO_MAX_AGE_SECONDS = 90 * 86400
 ORG_NAME = "RoPlayer"
 APP_NAME = "RoPlayer"
-APP_VERSION = "1.1.7"
+APP_VERSION = "1.1.11"
 APP_REPO_URL = "https://github.com/rohanisawesome/RoPlayer"
 
 # --------------------------------------------------------------------------
@@ -3945,6 +3945,9 @@ class AdaptiveMusicPlayer(QMainWindow):
     chromecast_connected = pyqtSignal(object)
     chromecast_connect_failed = pyqtSignal(str)
     chromecast_media_status = pyqtSignal(str)
+    chromecast_app_changed = pyqtSignal(str, str)  # app_id, display name of what's running on the speaker
+    chromecast_load_failed = pyqtSignal(str, bool, str)  # path that failed to load, already retried?, reason
+    chromecast_seek_failed = pyqtSignal(str, int)  # path, position_ms - fall back to a full reload there
     mprisArtReady = pyqtSignal()  # fires whenever a background art write finishes
     mprisServiceReady = pyqtSignal()
 
@@ -4387,6 +4390,10 @@ class AdaptiveMusicPlayer(QMainWindow):
         self.chromecast_connected.connect(self._handle_chromecast_connected)
         self.chromecast_connect_failed.connect(self._handle_chromecast_connect_failed)
         self.chromecast_media_status.connect(self._handle_chromecast_media_status)
+        self.chromecast_app_changed.connect(self._handle_chromecast_app_changed)
+        self.chromecast_load_failed.connect(self._handle_chromecast_load_failed)
+        self.chromecast_seek_failed.connect(self._handle_chromecast_seek_failed)
+        self._cast_load_started = 0.0
 
         # --- Chromecast lyric-sync delay compensation -----------------------
         # Our local QMediaPlayer keeps decoding (muted) alongside the cast so
@@ -11092,6 +11099,15 @@ class AdaptiveMusicPlayer(QMainWindow):
                         )
                 media_controller.register_status_listener(_StatusListener())
 
+                # Which app the speaker itself is running - lets us notice
+                # when something else (e.g. YouTube Music from a phone)
+                # takes the speaker over, instead of carrying on muted
+                # locally while nothing of ours plays anywhere.
+                class _CastAppListener:
+                    def new_cast_status(_self, status):
+                        self.chromecast_app_changed.emit(status.app_id or "", status.display_name or "")
+                cast.register_status_listener(_CastAppListener())
+
                 self.chromecast_connected.emit((cast, media_controller))
             except Exception as e:
                 self.chromecast_connect_failed.emit(str(e))
@@ -11153,6 +11169,47 @@ class AdaptiveMusicPlayer(QMainWindow):
         if "idle_reason=ERROR" in status_text:
             self.status_label.setText("Chromecast reported a load/playback error (see console)")
             self.status_label.setVisible(True)
+
+    def _handle_chromecast_load_failed(self, path: str, was_retry: bool, reason: str):
+        print(f"[Chromecast] Load failed ({'retry' if was_retry else 'first try'}): {reason}")  # Debug
+        if not self.chromecast_device or path != self._cast_loaded_path:
+            return  # disconnected, or a newer track has been cast since
+        if was_retry:
+            self._cast_loaded_path = None  # so Play tries again from scratch
+            self.status_label.setText("The speaker wouldn't start the song - press play to try again")
+            self.status_label.setVisible(True)
+            return
+        # Most often another app is stuck on the speaker and won't hand
+        # it over - close it, then load again. Restart the grace window
+        # first so the speaker going briefly idle from quit_app() isn't
+        # mistaken for something else taking it over.
+        self._cast_load_started = time.monotonic()
+        try:
+            self.chromecast_device.quit_app()
+        except Exception as e:
+            print(f"[Chromecast] quit_app() raised: {e}")  # Debug
+        QTimer.singleShot(2000, lambda: self.chromecast_device and self.cast_current_track(
+            self.player.position(), is_retry=True))
+
+    def _handle_chromecast_app_changed(self, app_id: str, display_name: str):
+        if not self.chromecast_device or self._cast_loaded_path is None:
+            return  # nothing of ours is on the speaker to lose
+        if app_id == pychromecast.config.APP_MEDIA_RECEIVER:
+            return  # still our receiver
+        if time.monotonic() - self._cast_load_started < 8:
+            # The speaker briefly reports the previous app (or none)
+            # while our receiver is launching for a fresh load.
+            return
+        print(f"[Chromecast] Speaker taken over by {display_name or app_id or 'nothing (idle)'}")  # Debug
+        # Forget our load first, so the pause below doesn't send a pause
+        # command to whatever app now owns the speaker, and so the next
+        # Play re-casts the track (which takes the speaker back).
+        self._cast_loaded_path = None
+        if self.is_playing:
+            self.toggle_play()
+        who = display_name or "Another app"
+        self.status_label.setText(f"{who} took over the speaker - press play to cast to it again")
+        self.status_label.setVisible(True)
 
     def disconnect_chromecast(self):
         if self.chromecast_device:
@@ -11328,7 +11385,7 @@ class AdaptiveMusicPlayer(QMainWindow):
             except Exception:
                 return "127.0.0.1"
 
-    def cast_current_track(self, start_position_ms: int = 0):
+    def cast_current_track(self, start_position_ms: int = 0, is_retry: bool = False):
         if not self.chromecast_device or self.current_track_index < 0:
             return
         self.start_local_http_server()
@@ -11367,9 +11424,17 @@ class AdaptiveMusicPlayer(QMainWindow):
             # kwarg from play_media(); artist/album now go through a
             # metadata dict instead.
             self._cast_loaded_path = path
+            self._cast_load_started = time.monotonic()
+            # Set before play_media() - a failure callback can update the
+            # status itself, and mustn't be overwritten by this afterwards.
+            self.status_label.setText(f"🎵 Casting: {title}")
             self.cast_media_controller.play_media(
                 url,
                 content_type=content_type,
+                # pychromecast defaults to "LIVE" (internet radio). These
+                # are finite files - "BUFFERED" lets the speaker buffer
+                # less and start, seek and pause like normal media.
+                stream_type="BUFFERED",
                 title=title,
                 current_time=max(0, start_position_ms) / 1000.0,
                 autoplay=self.is_playing,
@@ -11379,8 +11444,13 @@ class AdaptiveMusicPlayer(QMainWindow):
                     "artist": artist,
                     "albumName": album or "",
                 },
+                # pychromecast otherwise drops failures silently - e.g. a
+                # stuck app on the speaker refusing to make way for our
+                # receiver, leaving us "connected" with nothing playing.
+                callback_function=lambda ok, resp, p=path, r=is_retry: (
+                    None if ok else self.chromecast_load_failed.emit(p, r, str(resp)[:300])
+                ),
             )
-            self.status_label.setText(f"🎵 Casting: {title}")
             print(f"[Chromecast] play_media() sent for: {title}")  # Debug
         except Exception as e:
             self.status_label.setText(f"Cast error: {e}")
@@ -11904,11 +11974,8 @@ class AdaptiveMusicPlayer(QMainWindow):
                 self.scrobble_timer.stop()
             self.resume_save_timer.stop()
             self._save_resume_state()  # freeze the resume point too, exactly like MPRIS above
-            if self.chromecast_device and self.cast_media_controller:
-                try:
-                    self.cast_media_controller.pause()
-                except Exception as e:
-                    print(f"[Chromecast] pause() raised: {e}")  # Debug
+            if self.chromecast_device and self.cast_media_controller and self._cast_loaded_path is not None:
+                self._send_cast_media_command({"type": "PAUSE"})
         else:
             self.player.play()
             self.play_btn.set_playing(True)
@@ -11931,10 +11998,7 @@ class AdaptiveMusicPlayer(QMainWindow):
                     # once is_playing is True so it autoplays.
                     needs_cast_load = True
                 else:
-                    try:
-                        self.cast_media_controller.play()
-                    except Exception as e:
-                        print(f"[Chromecast] play() raised: {e}")  # Debug
+                    self._send_cast_media_command({"type": "PLAY"})
 
         self.is_playing = not self.is_playing
         if needs_cast_load:
@@ -12123,7 +12187,7 @@ class AdaptiveMusicPlayer(QMainWindow):
         # up to the last one. If another seek comes in before this timer
         # fires, it just gets pushed back - only the final settled
         # position actually gets sent to the cast device.
-        if self.chromecast_device and self.cast_media_controller:
+        if self.chromecast_device and self.cast_media_controller and self._cast_loaded_path is not None:
             self._pending_cast_seek_ms = position_ms
             self._chromecast_seek_debounce_timer.start(250)
 
@@ -12136,17 +12200,55 @@ class AdaptiveMusicPlayer(QMainWindow):
         # noticeably, seeking close to the end of a track would frequently
         # just get silently ignored (the local seekbar would move, but the
         # actual Chromecast audio wouldn't). cast_current_track() instead
-        # does a fresh play_media() reload at the target position - the
-        # same proven mechanism already used for switching tracks and for
-        # resuming playback position when first connecting to a
-        # Chromecast - which doesn't depend on the receiver's in-session
-        # seek handling being well-behaved. Clamped a little short of the
-        # real duration regardless, so a seek doesn't try to reload
-        # starting at (or past) the stream's actual end.
+        # does a fresh play_media() reload at the target position.
+        #
+        # That unreliability came from casting files as "LIVE" streams
+        # (see cast_current_track). As BUFFERED media a real seek lands in
+        # ~0.3s, even near the end, where a full reload meant ~6s of
+        # silence on every seek. The reload is kept only as a fallback for
+        # when the speaker rejects the seek.
         duration_ms = self.player.duration()
         if duration_ms > 0:
             position_ms = min(position_ms, max(0, duration_ms - 1500))
-        self.cast_current_track(start_position_ms=position_ms)
+        path = self._cast_loaded_path
+        if path is None:
+            self.cast_current_track(start_position_ms=position_ms)
+            return
+        self._send_cast_media_command(
+            {
+                "type": "SEEK",
+                "currentTime": position_ms / 1000.0,
+                # Stay paused if we're paused - a plain seek resumes playback.
+                "resumeState": "PLAYBACK_START" if self.is_playing else "PLAYBACK_PAUSE",
+            },
+            on_failure=lambda p=path, pos=position_ms: self.chromecast_seek_failed.emit(p, pos),
+        )
+
+    def _send_cast_media_command(self, command: dict, on_failure=None):
+        # Fire-and-forget media command (PLAY/PAUSE/SEEK). pychromecast's
+        # own play()/pause()/seek() block until the speaker answers, which
+        # froze the whole window for that long on every press.
+        mc = self.cast_media_controller
+        if mc is None:
+            return
+
+        def _callback(ok, response, kind=command.get("type")):
+            # Runs on pychromecast's thread - only print and emit signals here.
+            if not ok:
+                print(f"[Chromecast] {kind} failed: {str(response)[:200]}")  # Debug
+                if on_failure:
+                    on_failure()
+
+        try:
+            mc._send_command(dict(command), _callback)
+        except Exception as e:
+            print(f"[Chromecast] {command.get('type')} raised: {e}")  # Debug
+            if on_failure:
+                on_failure()
+
+    def _handle_chromecast_seek_failed(self, path: str, position_ms: int):
+        if self.chromecast_device and path == self._cast_loaded_path:
+            self.cast_current_track(start_position_ms=position_ms)
 
     def on_timeline_moved(self, position: int):
         self.time_elapsed_lbl.setText(format_time(position))
@@ -12667,7 +12769,7 @@ class AdaptiveMusicPlayer(QMainWindow):
         # Seeks from the desktop media widget / headset buttons used to
         # only move local (muted) playback, leaving the speaker playing
         # from the old spot - same debounced path the seek bar uses.
-        if self.chromecast_device and self.cast_media_controller:
+        if self.chromecast_device and self.cast_media_controller and self._cast_loaded_path is not None:
             self._pending_cast_seek_ms = position_ms
             self._chromecast_seek_debounce_timer.start(250)
 
@@ -12821,6 +12923,13 @@ class LibraryScanner(QThread):
 
 
 if __name__ == "__main__":
+    # Launched from the desktop, stdout goes to the journal rather than a
+    # terminal, and Python would otherwise hold log lines in a buffer
+    # (so [Chromecast]/[Last.fm] messages never showed up when needed).
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
     app = QApplication(sys.argv)
     # Force Qt's own built-in style rather than whatever native/GTK style
     # this platform would otherwise auto-select. Some style engines (GTK
