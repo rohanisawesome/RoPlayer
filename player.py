@@ -24,10 +24,13 @@ import webbrowser
 from typing import Optional
 import urllib.request
 import urllib.parse
+import urllib.error
 import json
 import threading
 import socket
 import http.server
+import mimetypes
+import secrets
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QPushButton, QVBoxLayout, QHBoxLayout, QWidget,
@@ -125,7 +128,7 @@ ARTIST_STATS_MAX_AGE_SECONDS = 1 * 86400
 ARTIST_BIO_MAX_AGE_SECONDS = 90 * 86400
 ORG_NAME = "RoPlayer"
 APP_NAME = "RoPlayer"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.7"
 APP_REPO_URL = "https://github.com/rohanisawesome/RoPlayer"
 
 # --------------------------------------------------------------------------
@@ -324,25 +327,12 @@ class ClickAnywhereSliderStyle(QProxyStyle):
 # --------------------------------------------------------------------------
 # Background Worker Engines (Scanner & Last.FM)
 # --------------------------------------------------------------------------
-import json
-import time
-import hashlib
-import urllib.parse
-import urllib.request
-import urllib.error
-from PyQt6.QtCore import QObject, QThread, pyqtSignal, QSettings
-
-class LibraryScanner(QObject):
-    progress = pyqtSignal(int)
-
-    def __init__(self, *args, **kwargs):
-        super().__init__()
-        # ... Put the rest of your original library scanner __init__ code here ...
-
-
 class LastfmWorker(QThread):
     status_msg = pyqtSignal(str)
     task_finished = pyqtSignal(bool, str)
+    # 9 = invalid session key (fixed by logging in again), 11 = service
+    # offline, 16 = temporary error, 29 = rate limit exceeded.
+    RETRYABLE_ERROR_CODES = (9, 11, 16, 29)
 
     def __init__(self, method_type, params, secret, session_key=None):
         super().__init__()
@@ -350,6 +340,10 @@ class LastfmWorker(QThread):
         self.initial_params = params if isinstance(params, dict) else {}
         self.secret = secret
         self.session_key = session_key
+        # Set when a failure is temporary (offline, timeout, Last.fm down,
+        # rate-limited, expired session) - scrobbles that fail this way
+        # get saved and resent later instead of being thrown away.
+        self.retryable = False
 
     def run(self):
         settings = QSettings(ORG_NAME, APP_NAME)
@@ -397,6 +391,7 @@ class LastfmWorker(QThread):
 
                 if "error" in resp_data:
                     error_msg = resp_data.get("message", "API Error")
+                    self.retryable = resp_data.get("error") in self.RETRYABLE_ERROR_CODES
                     print(f"[Last.fm Error] {action_name} failed: {error_msg}")
                     self.task_finished.emit(False, error_msg)
                 else:
@@ -423,12 +418,15 @@ class LastfmWorker(QThread):
                 error_body = json.loads(e.read().decode("utf-8"))
                 error_msg = error_body.get("message", f"HTTP {e.code}: {e.reason}")
                 error_code = error_body.get("error", "?")
+                self.retryable = e.code >= 500 or error_code in self.RETRYABLE_ERROR_CODES
                 print(f"[Last.fm Error] {action_name} failed (code {error_code}): {error_msg}")
             except Exception:
                 error_msg = f"HTTP {e.code}: {e.reason}"
+                self.retryable = e.code >= 500
                 print(f"[Last.fm Error] {action_name} failed: {error_msg}")
             self.task_finished.emit(False, error_msg)
         except Exception as e:
+            self.retryable = True  # no connection, DNS failure, timeout...
             print(f"[Last.fm Exception] Network error during {action_name}: {str(e)}")
             self.task_finished.emit(False, str(e))
 
@@ -4352,6 +4350,13 @@ class AdaptiveMusicPlayer(QMainWindow):
         # --- Last.fm Tracker Variables --------------------------------------
         self.lfm_async_threads = []
         self.current_scrobbled = False  # Track if the current track play instance has scrobbled
+        self._scrobble_flush_in_flight = False
+        # Resend scrobbles saved while offline - shortly after launch, then
+        # periodically in case the connection comes back mid-session.
+        QTimer.singleShot(5000, self._flush_pending_scrobbles)
+        self._pending_scrobble_retry_timer = QTimer(self)
+        self._pending_scrobble_retry_timer.timeout.connect(self._flush_pending_scrobbles)
+        self._pending_scrobble_retry_timer.start(10 * 60 * 1000)
 
         # --- Local play-history log ------------------------------------------
         # Backend-only for now (no UI reads from this yet) - the shared
@@ -4375,6 +4380,8 @@ class AdaptiveMusicPlayer(QMainWindow):
         self.local_http_server = None
         self.local_server_thread = None
         self.local_server_port = 8010
+        self._cast_served_files = {}  # URL token -> local path; the only files the cast server will hand out
+        self._cast_loaded_path = None  # track the Chromecast currently has loaded, if any
         self.chromecast_devices_found.connect(self._show_chromecast_device_menu)
         self.chromecast_scan_failed.connect(self._handle_chromecast_scan_failure)
         self.chromecast_connected.connect(self._handle_chromecast_connected)
@@ -9519,7 +9526,15 @@ class AdaptiveMusicPlayer(QMainWindow):
         if not os.path.exists(path):
             self.status_label.setText(f"File missing, skipping: {os.path.basename(path)}")
             self.status_label.setVisible(True)
-            self.play_track_at(row + 1, autoplay=autoplay)
+            # Looked up in one pass (not by recursing once per missing
+            # file - a whole unplugged drive's worth of tracks used to
+            # be able to hit Python's recursion limit), and following the
+            # shuffle order when shuffling rather than album order.
+            next_row = self._next_existing_track_after(row)
+            if next_row is None:
+                self._stop_at_end_of_context()
+            else:
+                self.play_track_at(next_row, autoplay=autoplay, resume_position_ms=0)
             return
 
         self.current_track_index = row
@@ -9763,6 +9778,18 @@ class AdaptiveMusicPlayer(QMainWindow):
             self._regenerate_shuffle_order()
 
     def play_previous(self):
+        # Standard player behaviour: a few seconds into a track, Previous
+        # restarts it; only near the start does it go to the prior track.
+        # Also gives Previous something to do on the first track (or the
+        # first shuffled one), where it used to do nothing at all.
+        if self.player.position() > 3000 or (
+            self.playback_mode == 3 and self.active_playing_album_key != self.QUEUE_KEY
+            and self.shuffle_position <= 0
+        ) or (self.playback_mode != 3 and self.current_track_index <= 0):
+            self.player.setPosition(0)
+            self._mpris_notify_seeked()
+            self._queue_chromecast_seek(0)
+            return
         if self.playback_mode == 3 and self.active_playing_album_key != self.QUEUE_KEY:
             # Walks shuffle_order backwards, mirroring play_next()'s
             # forward walk - using plain current_track_index - 1 here
@@ -9825,12 +9852,38 @@ class AdaptiveMusicPlayer(QMainWindow):
             if self.playback_mode == 1 and self.active_playing_tracks:
                 self.play_track_at(0)
             else:
-                self.play_btn.set_playing(False)
-                self.is_playing = False
-                self._refresh_playlist_detail_play_button()
-                self._mpris_notify({"PlaybackStatus": "Stopped"})
-                if HAS_DBUS_PYTHON:
-                    self._mpris_position_timer.stop()
+                self._stop_at_end_of_context()
+
+    def _stop_at_end_of_context(self):
+        self.play_btn.set_playing(False)
+        self.is_playing = False
+        self._refresh_playlist_detail_play_button()
+        self._mpris_notify({"PlaybackStatus": "Stopped"})
+        if HAS_DBUS_PYTHON:
+            self._mpris_position_timer.stop()
+
+    def _next_existing_track_after(self, row: int):
+        # The next track index after `row` whose file actually exists, in
+        # whatever order playback is really following - or None if there
+        # isn't one left.
+        tracks = self.active_playing_tracks
+        if self.playback_mode == 3 and self.active_playing_album_key != self.QUEUE_KEY:
+            self._ensure_shuffle_order()
+            if row in self.shuffle_order:
+                start = self.shuffle_order.index(row) + 1
+                for pos in range(start, len(self.shuffle_order)):
+                    index = self.shuffle_order[pos]
+                    if 0 <= index < len(tracks) and os.path.exists(tracks[index]):
+                        self.shuffle_position = pos
+                        return index
+                return None
+        candidates = list(range(row + 1, len(tracks)))
+        if self.playback_mode == 1:
+            candidates += list(range(0, row))  # repeat-playlist wraps around
+        for index in candidates:
+            if os.path.exists(tracks[index]):
+                return index
+        return None
 
     # --------------------------------------------------------- Play queue --
     def _play_next_from_queue(self):
@@ -9841,7 +9894,7 @@ class AdaptiveMusicPlayer(QMainWindow):
             # second/third queued track in a row), the real context to
             # return to was already captured on the way in.
             self._queue_return_context = (
-                list(self.active_playing_tracks), self.active_playing_album_key, self.current_track_index,
+                self.active_playing_tracks, self.active_playing_album_key, self.current_track_index,
             )
         path = self.play_queue.pop(0)
         self._refresh_queue_panel()
@@ -9863,7 +9916,7 @@ class AdaptiveMusicPlayer(QMainWindow):
             return
         if self.active_playing_album_key != self.QUEUE_KEY:
             self._queue_return_context = (
-                list(self.active_playing_tracks), self.active_playing_album_key, self.current_track_index,
+                self.active_playing_tracks, self.active_playing_album_key, self.current_track_index,
             )
         del self.play_queue[:index]
         path = self.play_queue.pop(0)
@@ -10305,14 +10358,135 @@ class AdaptiveMusicPlayer(QMainWindow):
         if album:
             scrobble_params["album"] = album
 
+        entry = {"artist": artist, "track": track, "album": album or "", "timestamp": int(ts)}
         scrobble_worker = LastfmWorker("scrobble", scrobble_params, secret)
         scrobble_worker.task_finished.connect(
-            lambda success, msg: self.log_lastfm_response(
-                "Last.fm: Track scrobbled successfully!" if success else f"Last.fm Scrobble Error: {msg}"
-            )
+            lambda success, msg, w=scrobble_worker, e=entry: self._on_scrobble_finished(success, msg, w, e)
         )
         self.lfm_async_threads.append(scrobble_worker)
         scrobble_worker.start()
+
+    def _on_scrobble_finished(self, success: bool, msg: str, worker, entry: dict):
+        if success:
+            self.log_lastfm_response("Last.fm: Track scrobbled successfully!")
+            # We're evidently online again - send anything that failed earlier.
+            self._flush_pending_scrobbles()
+        elif worker.retryable:
+            self._add_pending_scrobble(entry)
+            self.log_lastfm_response(f"Last.fm unavailable - scrobble saved, will retry ({msg})")
+        else:
+            self.log_lastfm_response(f"Last.fm Scrobble Error: {msg}")
+
+    def _maybe_scrobble(self):
+        # Last.fm's own rule: a track counts once it's been listened to
+        # for half its length or 4 minutes, whichever comes first, and
+        # tracks of 30 seconds or less never count. Checked on every
+        # position tick against genuinely listened time (same counter
+        # _maybe_log_play uses), so seeking ahead doesn't cheat it, and
+        # skipping near the end or quitting mid-song still scrobbles.
+        if self.current_scrobbled or not self.is_playing:
+            return
+        if not (0 <= self.current_track_index < len(self.active_playing_tracks)):
+            return
+        duration_ms = self.player.duration()
+        if duration_ms <= 30000:
+            return
+        if self._current_track_elapsed_listened_ms < min(240000, duration_ms / 2):
+            return
+
+        self.current_scrobbled = True
+        path = self.active_playing_tracks[self.current_track_index]
+        artist, album, _, _ = read_track_tags(path)
+        meta = self.album_display_meta.get(self.active_playing_album_key)
+        final_artist = artist if artist != "Unknown Artist" else (meta.get("artist", "Unknown Artist") if meta else "Unknown Artist")
+        final_album = album if album else (meta.get("title", "") if meta else "")
+        if final_artist == "Unknown Artist":
+            return
+        # Same title "Now Playing" uses - the real title tag, falling back
+        # to the filename only for untagged files. Using the filename here
+        # was scrobbling e.g. "05 - Justin Bieber - Love Yourself.mp3" as
+        # "Justin Bieber - Love Yourself".
+        self.submit_scrobble(final_artist, self.get_track_title(path), final_album,
+                             getattr(self, "current_track_start_ts", None))
+
+    # --- Offline scrobble queue ---------------------------------------------
+    # Last.fm accepts scrobbles up to 14 days old, so ones that fail for a
+    # temporary reason are kept on disk and resent in batches later.
+    PENDING_SCROBBLE_MAX_AGE_S = 14 * 24 * 3600
+
+    def _pending_scrobbles_path(self) -> str:
+        data_dir = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)
+        if not data_dir:
+            data_dir = os.path.expanduser(os.path.join("~", ".cache", APP_NAME))
+        os.makedirs(data_dir, exist_ok=True)
+        return os.path.join(data_dir, "pending_scrobbles.json")
+
+    def _load_pending_scrobbles(self) -> list:
+        try:
+            with open(self._pending_scrobbles_path(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return []
+        if not isinstance(data, list):
+            return []
+        cutoff = time.time() - self.PENDING_SCROBBLE_MAX_AGE_S
+        return [s for s in data if isinstance(s, dict) and s.get("timestamp", 0) > cutoff]
+
+    def _save_pending_scrobbles(self, pending: list):
+        try:
+            path = self._pending_scrobbles_path()
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(pending, f)
+            os.replace(tmp, path)
+        except OSError:
+            pass
+
+    def _add_pending_scrobble(self, entry: dict):
+        pending = self._load_pending_scrobbles()
+        if entry not in pending:
+            pending.append(entry)
+        self._save_pending_scrobbles(pending)
+
+    def _flush_pending_scrobbles(self):
+        if getattr(self, "_scrobble_flush_in_flight", False):
+            return
+        creds = self._get_lastfm_credentials()
+        if creds is None:
+            return
+        pending = self._load_pending_scrobbles()
+        if not pending:
+            return
+        api_key, sk, secret = creds
+        batch = pending[:50]  # Last.fm's per-request limit
+        params = {"method": "track.scrobble", "api_key": api_key, "sk": sk}
+        for i, s in enumerate(batch):
+            params[f"artist[{i}]"] = s["artist"]
+            params[f"track[{i}]"] = s["track"]
+            params[f"timestamp[{i}]"] = str(s["timestamp"])
+            if s.get("album"):
+                params[f"album[{i}]"] = s["album"]
+
+        worker = LastfmWorker("scrobble", params, secret)
+
+        def _done(success, msg, w=worker, sent=batch):
+            self._scrobble_flush_in_flight = False
+            if success or not w.retryable:
+                # Sent - or rejected for good (bad data), in which case
+                # retrying would just block everything queued behind it.
+                remaining = [s for s in self._load_pending_scrobbles() if s not in sent]
+                self._save_pending_scrobbles(remaining)
+                if success:
+                    self.log_lastfm_response(f"Last.fm: sent {len(sent)} saved scrobble(s)")
+                else:
+                    self.log_lastfm_response(f"Last.fm rejected saved scrobbles: {msg}")
+                if success and remaining:
+                    QTimer.singleShot(2000, self._flush_pending_scrobbles)
+
+        worker.task_finished.connect(_done)
+        self._scrobble_flush_in_flight = True
+        self.lfm_async_threads.append(worker)
+        worker.start()
 
     def dispatch_scrobble_submission(self):
         # Kept as an empty stub to ensure external hooks don't break
@@ -10953,8 +11127,10 @@ class AdaptiveMusicPlayer(QMainWindow):
         # otherwise the seekbar shows the middle of the song while the
         # Chromecast restarts it from the beginning.
         if hasattr(self, 'player') and self.player.source().isValid():
-            current_position_ms = self.player.position()
-            QTimer.singleShot(1200, lambda: self.cast_current_track(current_position_ms))
+            # Read the position when the cast actually happens, not now -
+            # local playback keeps going during this delay, so a position
+            # captured here would start the speaker ~1.2s behind.
+            QTimer.singleShot(1200, lambda: self.cast_current_track(self.player.position()))
         else:
             self.status_label.setText(f"✅ Connected to {cast.name} (play a song to cast)")
 
@@ -10982,7 +11158,7 @@ class AdaptiveMusicPlayer(QMainWindow):
         if self.chromecast_device:
             try:
                 self.cast_media_controller.stop()
-            except:
+            except Exception:
                 pass
             self.chromecast_device = None
             self.cast_media_controller = None
@@ -10999,12 +11175,43 @@ class AdaptiveMusicPlayer(QMainWindow):
                 pass
             self.chromecast_browser = None
 
+        # Nothing needs the media server once disconnected - don't leave
+        # it listening on the network until the app quits.
+        self._stop_local_http_server()
+
+    def _stop_local_http_server(self):
+        self._cast_served_files = {}
+        self._cast_loaded_path = None
+        if self.local_http_server:
+            server = self.local_http_server
+            self.local_http_server = None
+            self.local_server_thread = None
+            try:
+                server.shutdown()
+                server.server_close()
+            except Exception:
+                pass
+
     def start_local_http_server(self):
         if self.local_http_server:
             return
+        player_self = self
+
         class Handler(http.server.SimpleHTTPRequestHandler):
-            def __init__(self, *args, **kwargs):
-                super().__init__(*args, directory="/", **kwargs)
+            # Only ever serves the single track currently being cast, via
+            # an unguessable per-track token in the URL (see
+            # cast_current_track). This server listens on the whole LAN,
+            # so it must never map URLs onto the real filesystem -
+            # anything else on the network could otherwise browse and
+            # download any file this user can read.
+            def translate_path(self, path):
+                token = urllib.parse.urlsplit(path).path.lstrip('/').split('/', 1)[0]
+                return player_self._cast_served_files.get(token, "/nonexistent/roplayer-cast")
+
+            def list_directory(self, path):
+                self.send_error(404, "File not found")
+                return None
+
             def end_headers(self):
                 # Add CORS + advertise Range support without touching the
                 # response line - calling send_response() here AND letting
@@ -11134,24 +11341,35 @@ class AdaptiveMusicPlayer(QMainWindow):
 
         path = self.active_playing_tracks[self.current_track_index]
         filename = os.path.basename(path)
-        # path already starts with '/' on Linux/macOS, so don't add another
-        # one before it - avoids a doubled "//" in the URL.
-        encoded = urllib.parse.quote(path.replace(os.sep, '/')).lstrip('/')
+        # A fresh random token per track, and only the current track is
+        # servable - see start_local_http_server's Handler. The filename
+        # after it is just cosmetic (helps the receiver/logs), the server
+        # only looks at the token.
+        token = secrets.token_urlsafe(16)
+        self._cast_served_files = {token: path}
+        encoded_name = urllib.parse.quote(filename)
 
         local_ip = self._get_lan_ip()
-        url = f"http://{local_ip}:{self.local_server_port}/{encoded}"
+        url = f"http://{local_ip}:{self.local_server_port}/{token}/{encoded_name}"
         print(f"[Chromecast] Casting URL: {url}")  # Debug - try curl'ing this from another device
 
         artist, album, _, _ = read_track_tags(path)
-        title = clean_track_name(filename)
+        title = self.get_track_title(path)
+        # The real type of this file - always claiming audio/mpeg made the
+        # receiver reject or choke on anything that isn't actually an MP3
+        # (.m4a especially).
+        content_type = mimetypes.guess_type(filename)[0] or "audio/mpeg"
+        if filename.lower().endswith(".m4a"):
+            content_type = "audio/mp4"
 
         try:
             # Newer pychromecast versions (14.x) removed the artist= shortcut
             # kwarg from play_media(); artist/album now go through a
             # metadata dict instead.
+            self._cast_loaded_path = path
             self.cast_media_controller.play_media(
                 url,
-                content_type="audio/mpeg",
+                content_type=content_type,
                 title=title,
                 current_time=max(0, start_position_ms) / 1000.0,
                 autoplay=self.is_playing,
@@ -11674,6 +11892,7 @@ class AdaptiveMusicPlayer(QMainWindow):
                 self.play_track_at(0)
             return
 
+        needs_cast_load = False
         if self.is_playing:
             self.player.pause()
             self.play_btn.set_playing(False)
@@ -11700,12 +11919,26 @@ class AdaptiveMusicPlayer(QMainWindow):
                 self.scrobble_timer.start(30000)
             self.resume_save_timer.start()
             if self.chromecast_device and self.cast_media_controller:
-                try:
-                    self.cast_media_controller.play()
-                except Exception as e:
-                    print(f"[Chromecast] play() raised: {e}")  # Debug
+                current_path = (
+                    self.active_playing_tracks[self.current_track_index]
+                    if 0 <= self.current_track_index < len(self.active_playing_tracks) else None
+                )
+                if current_path is not None and current_path != self._cast_loaded_path:
+                    # The speaker doesn't have this track loaded (e.g. it
+                    # was restored paused at launch, or picked while
+                    # paused) - a bare play() would resume whatever it
+                    # had before, or nothing. Load it instead, below,
+                    # once is_playing is True so it autoplays.
+                    needs_cast_load = True
+                else:
+                    try:
+                        self.cast_media_controller.play()
+                    except Exception as e:
+                        print(f"[Chromecast] play() raised: {e}")  # Debug
 
         self.is_playing = not self.is_playing
+        if needs_cast_load:
+            self.cast_current_track(self.player.position())
         self._refresh_playlist_detail_play_button()
 
     def cycle_playback_mode(self):
@@ -11741,26 +11974,9 @@ class AdaptiveMusicPlayer(QMainWindow):
             self._pending_resume_position_ms = 0
 
         if status == QMediaPlayer.MediaStatus.EndOfMedia:
-            session_key = self.settings.value("lfm_sk", None)
-
-            
-            if session_key and not getattr(self, "current_scrobbled", False):
-                path = self.active_playing_tracks[self.current_track_index]
-                track_name = os.path.basename(path)
-                artist, album, _, _ = read_track_tags(path)
-
-                # Check display fallback meta if file tag lacks album detail
-                meta = self.album_display_meta.get(self.active_playing_album_key)
-                final_artist = artist if artist != "Unknown Artist" else (meta.get("artist", "Unknown Artist") if meta else "Unknown Artist")
-                final_album = album if album else (meta.get("title", "") if meta else "")
-
-                if final_artist != "Unknown Artist":
-                    self.current_scrobbled = True
-                    track_title = clean_track_name(track_name)
-                    self.submit_scrobble(
-                        final_artist, track_title, final_album,
-                        getattr(self, "current_track_start_ts", None)
-                    )
+            # Scrobbling no longer happens here - see _maybe_scrobble,
+            # which submits as soon as the Last.fm threshold is reached
+            # (so skips near the end and quitting mid-track still count).
 
             # Clean out terminated threads safely from memory lists
             self.lfm_async_threads = [t for t in self.lfm_async_threads if t.isRunning()]
@@ -11803,6 +12019,7 @@ class AdaptiveMusicPlayer(QMainWindow):
         # actually updates.
         self._accumulate_listening_time(position)
         self._maybe_log_play()
+        self._maybe_scrobble()
 
     def _accumulate_listening_time(self, position_ms: int):
         # Tracks genuine elapsed listening time per track, live and
@@ -12435,13 +12652,24 @@ class AdaptiveMusicPlayer(QMainWindow):
             self.toggle_play()
 
     def _mpris_handle_seek(self, offset_us: int):
-        new_pos_ms = self.player.position() + int(offset_us / 1000)
-        self.player.setPosition(max(0, new_pos_ms))
+        new_pos_ms = max(0, self.player.position() + int(offset_us / 1000))
+        self.player.setPosition(new_pos_ms)
         self._mpris_notify_seeked()
+        self._queue_chromecast_seek(new_pos_ms)
 
     def _mpris_handle_set_position(self, position_us: int):
-        self.player.setPosition(max(0, int(position_us / 1000)))
+        new_pos_ms = max(0, int(position_us / 1000))
+        self.player.setPosition(new_pos_ms)
         self._mpris_notify_seeked()
+        self._queue_chromecast_seek(new_pos_ms)
+
+    def _queue_chromecast_seek(self, position_ms: int):
+        # Seeks from the desktop media widget / headset buttons used to
+        # only move local (muted) playback, leaving the speaker playing
+        # from the old spot - same debounced path the seek bar uses.
+        if self.chromecast_device and self.cast_media_controller:
+            self._pending_cast_seek_ms = position_ms
+            self._chromecast_seek_debounce_timer.start(250)
 
     def _mpris_handle_raise(self):
         self.showNormal()
@@ -12511,11 +12739,7 @@ class AdaptiveMusicPlayer(QMainWindow):
             except Exception:
                 pass
 
-        if self.local_http_server:
-            try:
-                self.local_http_server.shutdown()
-            except Exception:
-                pass
+        self._stop_local_http_server()
 
         event.accept()
 
@@ -12531,30 +12755,34 @@ class LibraryScanner(QThread):
 
     def run(self):
         try:
+            # Keyed by each folder's full path, not just its name - two
+            # different albums in same-named folders (Artist A/Greatest
+            # Hits and Artist B/Greatest Hits, or several "Disc 1"s) used
+            # to be lumped together and all credited using the first
+            # one's tags. Folders that really are the same album (e.g.
+            # Disc 1/Disc 2) still merge below, via the album key built
+            # from their tags.
             folders: dict[str, list[str]] = {}
             folder_mtimes: dict[str, float] = {}
+            root_folder = os.path.normpath(self.root_folder)
             for root, dirs, files in os.walk(self.root_folder):
                 dirs.sort()
                 matching = [f for f in sorted(files) if os.path.splitext(f)[1].lower() in SUPPORTED_EXTENSIONS]
                 if not matching:
                     continue
-                folder_name = os.path.basename(root)
-                if folder_name == os.path.basename(self.root_folder):
-                    folder_name = "Singles"
+                folder_key = os.path.normpath(root)
                 for filename in matching:
-                    folders.setdefault(folder_name, []).append(os.path.join(root, filename))
-                # Multiple distinct paths can share the same leaf folder
-                # name (matches how `folders` above is already keyed) -
-                # take whichever is most recently touched among them.
+                    folders.setdefault(folder_key, []).append(os.path.join(root, filename))
                 try:
-                    root_mtime = os.path.getmtime(root)
-                    folder_mtimes[folder_name] = max(folder_mtimes.get(folder_name, 0.0), root_mtime)
+                    folder_mtimes[folder_key] = os.path.getmtime(root)
                 except OSError:
-                    folder_mtimes.setdefault(folder_name, 0.0)
-            
+                    folder_mtimes[folder_key] = 0.0
+
             albums: dict[str, dict] = {}
             total = len(folders)
-            for index, (folder_name, paths) in enumerate(folders.items(), start=1):
+            for index, (folder_key, paths) in enumerate(folders.items(), start=1):
+                # Loose files directly in the library folder itself.
+                folder_name = "Singles" if folder_key == root_folder else os.path.basename(folder_key)
                 artist, album_title, year, cover_bytes = read_track_tags(paths[0])
                 if not album_title:
                     album_title = folder_name
@@ -12570,7 +12798,7 @@ class LibraryScanner(QThread):
                     if title:
                         track_titles[p] = title
 
-                added_ts = folder_mtimes.get(folder_name, 0.0)
+                added_ts = folder_mtimes.get(folder_key, 0.0)
                 key = f"{artist.lower()}|||{year}|||{album_title.lower()}"
                 if key in albums:
                     albums[key]["paths"].extend(paths)
