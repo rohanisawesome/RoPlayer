@@ -128,7 +128,7 @@ ARTIST_STATS_MAX_AGE_SECONDS = 1 * 86400
 ARTIST_BIO_MAX_AGE_SECONDS = 90 * 86400
 ORG_NAME = "RoPlayer"
 APP_NAME = "RoPlayer"
-APP_VERSION = "1.1.12"
+APP_VERSION = "1.1.13"
 APP_REPO_URL = "https://github.com/rohanisawesome/RoPlayer"
 
 # --------------------------------------------------------------------------
@@ -3948,6 +3948,7 @@ class AdaptiveMusicPlayer(QMainWindow):
     chromecast_app_changed = pyqtSignal(str, str)  # app_id, display name of what's running on the speaker
     chromecast_load_failed = pyqtSignal(str, bool, str)  # path that failed to load, already retried?, reason
     chromecast_seek_failed = pyqtSignal(str, int)  # path, position_ms - fall back to a full reload there
+    chromecast_player_state = pyqtSignal(str, str, str, float)  # player_state, idle_reason, content_id, current_time (s)
     mprisArtReady = pyqtSignal()  # fires whenever a background art write finishes
     mprisServiceReady = pyqtSignal()
 
@@ -4393,6 +4394,10 @@ class AdaptiveMusicPlayer(QMainWindow):
         self.chromecast_app_changed.connect(self._handle_chromecast_app_changed)
         self.chromecast_load_failed.connect(self._handle_chromecast_load_failed)
         self.chromecast_seek_failed.connect(self._handle_chromecast_seek_failed)
+        self.chromecast_player_state.connect(self._handle_chromecast_player_state)
+        self._cast_loaded_url = None
+        self._cast_last_command_ts = 0.0
+        self._suppress_cast_commands = False  # True while mirroring a pause/play that came from the speaker
         self._cast_load_started = 0.0
 
         # --- Chromecast lyric-sync delay compensation -----------------------
@@ -11097,6 +11102,10 @@ class AdaptiveMusicPlayer(QMainWindow):
                             f"idle_reason={status.idle_reason} "
                             f"content_id={status.content_id}"
                         )
+                        self.chromecast_player_state.emit(
+                            status.player_state or "", status.idle_reason or "",
+                            status.content_id or "", float(status.current_time or 0.0),
+                        )
                 media_controller.register_status_listener(_StatusListener())
 
                 # Which app the speaker itself is running - lets us notice
@@ -11169,6 +11178,49 @@ class AdaptiveMusicPlayer(QMainWindow):
         if "idle_reason=ERROR" in status_text:
             self.status_label.setText("Chromecast reported a load/playback error (see console)")
             self.status_label.setVisible(True)
+
+    def _handle_chromecast_player_state(self, state: str, idle_reason: str, content_id: str, current_time_s: float):
+        # Mirrors pauses/resumes that happen on the speaker itself - tapping
+        # the Nest Mini, "Hey Google, pause", the Google Home app - so
+        # RoPlayer doesn't keep "playing" (muted) while the speaker is
+        # silent, or sit paused while the speaker plays.
+        if not self.chromecast_device or self._cast_loaded_path is None:
+            return
+        if not content_id or content_id != self._cast_loaded_url:
+            return  # a status about some other/older media
+        now = time.monotonic()
+        # The speaker echoes our own commands back, and reports
+        # IDLE/BUFFERING while a load starts - only act on changes we
+        # didn't just cause ourselves.
+        if now - self._cast_last_command_ts < 2.0 or now - self._cast_load_started < 3.0:
+            return
+        speaker_position_ms = int(current_time_s * 1000)
+
+        if state == "PAUSED" and self.is_playing:
+            print("[Chromecast] Paused on the speaker - pausing RoPlayer")  # Debug
+            self._mirror_speaker_play_state(playing=False, position_ms=speaker_position_ms)
+        elif state == "PLAYING" and not self.is_playing:
+            print("[Chromecast] Resumed on the speaker - resuming RoPlayer")  # Debug
+            self._mirror_speaker_play_state(playing=True, position_ms=speaker_position_ms)
+        elif state == "IDLE" and idle_reason == "CANCELLED" and self.is_playing:
+            # Stopped on the speaker ("Hey Google, stop"). The media is
+            # gone from it, so the next Play has to load it again.
+            print("[Chromecast] Stopped on the speaker - pausing RoPlayer")  # Debug
+            self._mirror_speaker_play_state(playing=False, position_ms=None)
+            self._cast_loaded_path = None
+
+    def _mirror_speaker_play_state(self, playing: bool, position_ms):
+        if position_ms is not None and position_ms > 0:
+            # The speaker is what's actually audible - line RoPlayer's
+            # position up with it.
+            self.player.setPosition(position_ms)
+            self._mpris_notify_seeked()
+        if playing != self.is_playing:
+            self._suppress_cast_commands = True
+            try:
+                self.toggle_play()
+            finally:
+                self._suppress_cast_commands = False
 
     def _handle_chromecast_load_failed(self, path: str, was_retry: bool, reason: str):
         print(f"[Chromecast] Load failed ({'retry' if was_retry else 'first try'}): {reason}")  # Debug
@@ -11469,6 +11521,7 @@ class AdaptiveMusicPlayer(QMainWindow):
             # kwarg from play_media(); artist/album now go through a
             # metadata dict instead.
             self._cast_loaded_path = path
+            self._cast_loaded_url = url
             self._cast_load_started = time.monotonic()
             # Set before play_media() - a failure callback can update the
             # status itself, and mustn't be overwritten by this afterwards.
@@ -12019,7 +12072,8 @@ class AdaptiveMusicPlayer(QMainWindow):
                 self.scrobble_timer.stop()
             self.resume_save_timer.stop()
             self._save_resume_state()  # freeze the resume point too, exactly like MPRIS above
-            if self.chromecast_device and self.cast_media_controller and self._cast_loaded_path is not None:
+            if (self.chromecast_device and self.cast_media_controller and self._cast_loaded_path is not None
+                    and not self._suppress_cast_commands):
                 self._send_cast_media_command({"type": "PAUSE"})
         else:
             self.player.play()
@@ -12030,7 +12084,7 @@ class AdaptiveMusicPlayer(QMainWindow):
             if hasattr(self, "scrobble_timer") and self.scrobble_timer is not None:
                 self.scrobble_timer.start(30000)
             self.resume_save_timer.start()
-            if self.chromecast_device and self.cast_media_controller:
+            if self.chromecast_device and self.cast_media_controller and not self._suppress_cast_commands:
                 current_path = (
                     self.active_playing_tracks[self.current_track_index]
                     if 0 <= self.current_track_index < len(self.active_playing_tracks) else None
@@ -12276,6 +12330,7 @@ class AdaptiveMusicPlayer(QMainWindow):
         mc = self.cast_media_controller
         if mc is None:
             return
+        self._cast_last_command_ts = time.monotonic()
 
         def _callback(ok, response, kind=command.get("type")):
             # Runs on pychromecast's thread - only print and emit signals here.
