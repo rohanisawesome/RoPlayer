@@ -41,7 +41,8 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import (
     Qt, QUrl, QSize, QRect, QRectF, QPointF, QThread, pyqtSignal, QObject,
     QSettings, QPropertyAnimation, QVariantAnimation, QEasingCurve,
-    pyqtProperty, QTimer, QPoint, QStandardPaths, QEvent, QBuffer, QIODevice
+    pyqtProperty, QTimer, QPoint, QStandardPaths, QEvent, QBuffer, QIODevice,
+    QParallelAnimationGroup
 )
 
 from PyQt6.QtGui import (
@@ -111,7 +112,7 @@ HOME_GRID_SIZE = QSize(232, 337)  # same 12px spacing buffer relationship as CAR
 ARTIST_CARD_SIZE = QSize(156, 232)
 ARTIST_GRID_SIZE = QSize(169, 243)
 ARTIST_COVER_SIZE = 140  # matches the ~1.12x scale AlbumCardWidget derives from ARTIST_CARD_SIZE.width()
-ARTIST_DETAIL_PHOTO_SIZE = 110  # the bigger photo shown in the artist detail panel above the filtered album grid
+ARTIST_DETAIL_PHOTO_SIZE = 132  # the bigger photo shown in the artist detail panel above the filtered album grid
 # How long cached artist-detail data is trusted before re-fetching -
 # separate windows since listener/scrobble counts climb daily and are
 # worth checking often, while a bio is close to static and re-fetching it
@@ -618,6 +619,7 @@ class ArtistInfoFetcher(QThread):
         text = re.sub(r"<[^>]+>", "", text)
         return html.unescape(text).strip()
 
+
 # Last.FM Connection Management Dialog UI
 # --------------------------------------------------------------------------
 class LastfmLoginDialog(QDialog):
@@ -889,11 +891,9 @@ class SettingsLinkButton(QPushButton):
 
 
 class SettingsDialog(QDialog):
-    # A sidebar + stacked content area, deliberately built the same shape
-    # a "real" multi-section settings dialog would be (so adding a second
-    # tab later is just another sidebar entry + another stacked page) -
-    # but only "About" is actually populated for now. Nothing here talks
-    # to the rest of the app; it's read-only informational content.
+    # A sidebar + stacked content area - Preferences holds actual toggles,
+    # Statistics is a read-only fun-facts summary (see get_fun_stats on
+    # the main window), About is static informational content.
     # Same red as WinCloseButton's hover state elsewhere in this app - and
     # what the actual bundled app icon (a red circle) already is - rather
     # than introducing a second, unrelated accent color just for this
@@ -990,6 +990,17 @@ class SettingsDialog(QDialog):
             QPushButton#SettingsLinkButton:hover {{
                 background-color: rgba(255,255,255,0.14);
             }}
+            QLineEdit#SettingsTextInput {{
+                background-color: rgba(255,255,255,0.05);
+                border: 1px solid rgba(255,255,255,0.1);
+                border-radius: 8px;
+                padding: 7px 10px;
+                font-size: 12px;
+                color: #FFFFFF;
+            }}
+            QLineEdit#SettingsTextInput:focus {{
+                border: 1px solid rgba(255,255,255,0.3);
+            }}
             QCheckBox#PreferenceToggle {{
                 spacing: 0px;
             }}
@@ -1023,6 +1034,7 @@ class SettingsDialog(QDialog):
 
         self._content_stack = QStackedWidget(self)
         self._content_stack.addWidget(self._wrap_settings_page(self._build_preferences_page()))
+        self._content_stack.addWidget(self._wrap_settings_page(self._build_statistics_page()))
         self._content_stack.addWidget(self._wrap_settings_page(self._build_about_page(app_icon_pixmap)))
         self._sidebar_list.currentRowChanged.connect(self._content_stack.setCurrentIndex)
         layout.addWidget(self._content_stack, stretch=1)
@@ -1044,10 +1056,10 @@ class SettingsDialog(QDialog):
 
     def _build_sidebar(self, app_icon_pixmap: Optional[QPixmap]) -> QWidget:
         # A nav list plus a small branded footer underneath, rather than
-        # just the list on its own - with only two entries (Preferences/
-        # About), a bare list left most of this column empty air with
-        # nothing anchoring the bottom of it, which is what actually read
-        # as "off"/unfinished rather than any single element being
+        # just the list on its own - with only a handful of entries, a
+        # bare list left most of this column empty air with nothing
+        # anchoring the bottom of it, which is what actually read as
+        # "off"/unfinished rather than any single element being
         # technically broken. The footer gives that space a reason to be
         # there instead of trying to force the list to fill it.
         container = QWidget(self)
@@ -1058,9 +1070,9 @@ class SettingsDialog(QDialog):
         container_layout.setSpacing(0)
 
         # Preferences first - it's the actionable page (toggles that
-        # actually change something), About is just static/informational,
-        # so it makes sense as the second stop rather than the default
-        # landing page.
+        # actually change something); Statistics and About are both
+        # read-only, so they trail behind it rather than either one being
+        # the default landing page.
         self._sidebar_list = QListWidget(container)
         self._sidebar_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         # QSS margin/spacing on ::item isn't reliably honored by a list
@@ -1070,7 +1082,7 @@ class SettingsDialog(QDialog):
         # highlight (see the stylesheet) actually needs to not look like
         # it's crowding the row below it.
         self._sidebar_list.setSpacing(4)
-        for icon, text in (("\u2699", "Preferences"), ("\u2139", "About")):
+        for icon, text in (("\u2699", "Preferences"), ("\U0001F4CA", "Statistics"), ("\u2139", "About")):
             item = QListWidgetItem(self._sidebar_list)
             item.setSizeHint(QSize(0, 40))
             self._sidebar_list.setItemWidget(item, self._build_sidebar_nav_row(icon, text))
@@ -1219,7 +1231,7 @@ class SettingsDialog(QDialog):
         page_layout.addWidget(card)
         page_layout.addStretch(1)
 
-        return page
+        return self._wrap_in_scroll_area(page)
 
     def _on_trending_badge_toggled(self, checked: bool):
         main_window = self.parent()
@@ -1230,6 +1242,247 @@ class SettingsDialog(QDialog):
         # The Artist view itself only actually picks this up once the
         # dialog closes (see open_settings_dialog) - this dialog is
         # modal, so nothing behind it is visible to update live anyway.
+
+    def _build_statistics_page(self) -> QWidget:
+        # A lightweight, read-only "Wrapped"-style summary, built fresh
+        # every time this dialog opens from the main window's own
+        # get_fun_stats() - nothing here is cached or stored separately,
+        # so it's always exactly as current as play_history.jsonl is.
+        # Wrapped in a scroll area (same smooth wheel-scroll as the Home
+        # page - see ControlledScrollArea) since there's more here than
+        # the dialog's fixed 460px height can show at once.
+        main_window = self.parent()
+        stats = main_window.get_fun_stats() if main_window is not None else {}
+
+        content = QWidget(self)
+        page_layout = QVBoxLayout(content)
+        page_layout.setContentsMargins(0, 0, 6, 4)
+        page_layout.setSpacing(14)
+
+        heading = QLabel("Statistics", content)
+        heading.setStyleSheet("font-size: 15px; font-weight: 800; color: rgba(255,255,255,0.95);")
+        page_layout.addWidget(heading)
+
+        if not stats.get("total_plays"):
+            section_lbl = QLabel("ALL TIME", content)
+            section_lbl.setObjectName("SettingsSectionLabel")
+            page_layout.addWidget(section_lbl)
+            empty_card, empty_layout = self._build_card_container()
+            empty_lbl = QLabel(
+                "Nothing tracked yet \u2014 play a few songs and check back here.", empty_card
+            )
+            empty_lbl.setWordWrap(True)
+            empty_lbl.setStyleSheet("font-size: 12px; color: rgba(255,255,255,0.6); background: transparent; border: none;")
+            empty_layout.addWidget(empty_lbl)
+            page_layout.addWidget(empty_card)
+            page_layout.addStretch(1)
+            return self._wrap_in_scroll_area(content)
+
+        # --- All time --------------------------------------------------
+        section_lbl = QLabel("ALL TIME", content)
+        section_lbl.setObjectName("SettingsSectionLabel")
+        page_layout.addWidget(section_lbl)
+
+        tiles_row = QHBoxLayout()
+        tiles_row.setSpacing(10)
+        tiles_row.addWidget(self._build_stat_tile(str(stats["total_plays"]), "Total Plays"), stretch=1)
+        tiles_row.addWidget(self._build_stat_tile(
+            main_window._format_total_duration(stats["total_listening_ms"]), "Time Listened"
+        ), stretch=1)
+        tiles_row.addWidget(self._build_stat_tile(str(stats["unique_tracks"]), "Unique Tracks"), stretch=1)
+        page_layout.addLayout(tiles_row)
+
+        # --- Your Favorites ----------------------------------------------
+        favorites_card, favorites_layout = self._build_card_container()
+        favorites_title = QLabel("Your Favorites", favorites_card)
+        favorites_title.setStyleSheet("font-size: 13px; font-weight: 700; background: transparent; border: none;")
+        favorites_layout.addWidget(favorites_title)
+
+        favorite_rows = []
+        if stats.get("top_track"):
+            title, artist, count = stats["top_track"]
+            favorite_rows.append(("Most Played Song", f"{title} \u2014 {artist}", count))
+        if stats.get("top_artist"):
+            name, count = stats["top_artist"]
+            favorite_rows.append(("Most Played Artist", name, count))
+        if stats.get("top_album"):
+            title, artist, count = stats["top_album"]
+            favorite_rows.append(("Most Played Album", f"{title} \u2014 {artist}", count))
+
+        for i, (caption, text, count) in enumerate(favorite_rows):
+            if i > 0:
+                divider = QFrame(favorites_card)
+                divider.setFrameShape(QFrame.Shape.HLine)
+                divider.setStyleSheet("background-color: rgba(255,255,255,0.06); border: none; max-height: 1px;")
+                favorites_layout.addWidget(divider)
+            favorites_layout.addLayout(self._build_favorite_row(favorites_card, caption, text, count))
+
+        page_layout.addWidget(favorites_card)
+
+        # --- Listening habits --------------------------------------------
+        habits_lbl = QLabel("LISTENING HABITS", content)
+        habits_lbl.setObjectName("SettingsSectionLabel")
+        page_layout.addWidget(habits_lbl)
+
+        habits_row = QHBoxLayout()
+        habits_row.setSpacing(10)
+        if stats.get("busiest_day"):
+            busiest_date, busiest_count = stats["busiest_day"]
+            habits_row.addWidget(
+                self._build_stat_tile(str(busiest_count), f"Busiest Day ({busiest_date})"), stretch=1
+            )
+        else:
+            habits_row.addWidget(self._build_stat_tile("\u2014", "Busiest Day"), stretch=1)
+        streak = stats["longest_streak_days"]
+        habits_row.addWidget(
+            self._build_stat_tile(str(streak), "Longest Streak"), stretch=1
+        )
+        habits_row.addWidget(
+            self._build_stat_tile(f"{stats['avg_plays_per_day']:.1f}", "Plays Per Day"), stretch=1
+        )
+        page_layout.addLayout(habits_row)
+
+        # --- Your library ----------------------------------------------
+        library_lbl = QLabel("YOUR LIBRARY", content)
+        library_lbl.setObjectName("SettingsSectionLabel")
+        page_layout.addWidget(library_lbl)
+
+        library_row = QHBoxLayout()
+        library_row.setSpacing(10)
+        library_row.addWidget(self._build_stat_tile(str(stats["library_album_count"]), "Albums"), stretch=1)
+        library_row.addWidget(self._build_stat_tile(str(stats["library_artist_count"]), "Artists"), stretch=1)
+        library_row.addWidget(self._build_stat_tile(str(stats["library_track_count"]), "Tracks"), stretch=1)
+        page_layout.addLayout(library_row)
+
+        # --- Leaderboards ------------------------------------------------
+        if stats["top_tracks"] or stats["top_artists"] or stats["top_albums"]:
+            leaderboards_lbl = QLabel("LEADERBOARDS", content)
+            leaderboards_lbl.setObjectName("SettingsSectionLabel")
+            page_layout.addWidget(leaderboards_lbl)
+
+            if stats["top_tracks"]:
+                entries = [(title, artist, count) for title, artist, count in stats["top_tracks"]]
+                page_layout.addWidget(self._build_leaderboard_card("Top Songs", entries))
+            if stats["top_artists"]:
+                entries = [(name, None, count) for name, count in stats["top_artists"]]
+                page_layout.addWidget(self._build_leaderboard_card("Top Artists", entries))
+            if stats["top_albums"]:
+                entries = [(title, artist, count) for title, artist, count in stats["top_albums"]]
+                page_layout.addWidget(self._build_leaderboard_card("Top Albums", entries))
+
+        # --- Footer -----------------------------------------------------
+        if stats.get("tracking_since_ts"):
+            since_text = time.strftime("%b %d, %Y", time.localtime(stats["tracking_since_ts"]))
+            days = max(0, (int(time.time()) - stats["tracking_since_ts"]) // 86400)
+            footer_lbl = QLabel(
+                f"Tracking your listening since {since_text} \u2014 {days} day{'s' if days != 1 else ''} and counting.",
+                content,
+            )
+            footer_lbl.setWordWrap(True)
+            footer_lbl.setStyleSheet("font-size: 11px; color: rgba(255,255,255,0.4);")
+            page_layout.addWidget(footer_lbl)
+
+        page_layout.addStretch(1)
+        return self._wrap_in_scroll_area(content)
+
+    def _wrap_in_scroll_area(self, content: QWidget) -> QWidget:
+        scroll_area = ControlledScrollArea(self)
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll_area.setWidget(content)
+        return scroll_area
+
+    def _build_stat_tile(self, value: str, label: str) -> QWidget:
+        # A small "Wrapped"-style number tile - the same accent-bordered
+        # card shell as everything else in this dialog (_build_card_
+        # container), just tighter spacing and a big number instead of a
+        # paragraph of text.
+        card, card_layout = self._build_card_container()
+        card_layout.setSpacing(2)
+        value_lbl = QLabel(value, card)
+        value_lbl.setWordWrap(True)
+        value_lbl.setStyleSheet(f"font-size: 20px; font-weight: 800; color: {self._ACCENT}; background: transparent; border: none;")
+        label_lbl = QLabel(label.upper(), card)
+        label_lbl.setWordWrap(True)
+        label_lbl.setStyleSheet("font-size: 10px; font-weight: 700; color: rgba(255,255,255,0.45); background: transparent; border: none;")
+        card_layout.addWidget(value_lbl)
+        card_layout.addWidget(label_lbl)
+        return card
+
+    def _build_favorite_row(self, container: QWidget, caption: str, text: str, count: int) -> QVBoxLayout:
+        # One "Your Favorites" entry: a small caption + play-count badge
+        # on top, the actual title/artist text underneath - wrapped
+        # rather than elided, since a long track/album title paired with
+        # its artist can easily run past this card's width.
+        col = QVBoxLayout()
+        col.setSpacing(2)
+
+        caption_row = QHBoxLayout()
+        caption_lbl = QLabel(caption.upper(), container)
+        caption_lbl.setStyleSheet("font-size: 10px; font-weight: 800; color: rgba(255,255,255,0.4); background: transparent; border: none;")
+        count_lbl = QLabel(f"{count}\u00d7 played", container)
+        count_lbl.setStyleSheet(f"font-size: 10px; font-weight: 800; color: {self._ACCENT}; background: transparent; border: none;")
+        caption_row.addWidget(caption_lbl)
+        caption_row.addStretch(1)
+        caption_row.addWidget(count_lbl)
+        col.addLayout(caption_row)
+
+        text_lbl = QLabel(text, container)
+        text_lbl.setWordWrap(True)
+        text_lbl.setStyleSheet("font-size: 13px; font-weight: 700; color: #FFFFFF; background: transparent; border: none;")
+        col.addWidget(text_lbl)
+        return col
+
+    def _build_leaderboard_card(self, heading: str, entries: list) -> QWidget:
+        # entries: [(main_text, sub_text_or_None, count), ...], already
+        # ranked and capped at 5 by get_fun_stats - this just lays out
+        # whatever it's handed, numbered from 1.
+        card, card_layout = self._build_card_container()
+        title_lbl = QLabel(heading, card)
+        title_lbl.setStyleSheet("font-size: 13px; font-weight: 700; background: transparent; border: none;")
+        card_layout.addWidget(title_lbl)
+
+        for i, (main_text, sub_text, count) in enumerate(entries, start=1):
+            if i > 1:
+                divider = QFrame(card)
+                divider.setFrameShape(QFrame.Shape.HLine)
+                divider.setStyleSheet("background-color: rgba(255,255,255,0.06); border: none; max-height: 1px;")
+                card_layout.addWidget(divider)
+            card_layout.addLayout(self._build_leaderboard_row(card, i, main_text, sub_text, count))
+
+        return card
+
+    def _build_leaderboard_row(self, container: QWidget, rank: int, main_text: str,
+                                sub_text: Optional[str], count: int) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setSpacing(10)
+
+        rank_lbl = QLabel(str(rank), container)
+        rank_lbl.setFixedWidth(16)
+        rank_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        rank_color = self._ACCENT if rank == 1 else "rgba(255,255,255,0.4)"
+        rank_lbl.setStyleSheet(f"font-size: 12px; font-weight: 800; color: {rank_color}; background: transparent; border: none;")
+        row.addWidget(rank_lbl, alignment=Qt.AlignmentFlag.AlignTop)
+
+        text_col = QVBoxLayout()
+        text_col.setSpacing(0)
+        main_lbl = QLabel(main_text, container)
+        main_lbl.setWordWrap(True)
+        main_lbl.setStyleSheet("font-size: 12px; font-weight: 700; color: #FFFFFF; background: transparent; border: none;")
+        text_col.addWidget(main_lbl)
+        if sub_text:
+            sub_lbl = QLabel(sub_text, container)
+            sub_lbl.setWordWrap(True)
+            sub_lbl.setStyleSheet("font-size: 10px; color: rgba(255,255,255,0.45); background: transparent; border: none;")
+            text_col.addWidget(sub_lbl)
+        row.addLayout(text_col, stretch=1)
+
+        count_lbl = QLabel(f"{count}\u00d7", container)
+        count_lbl.setStyleSheet("font-size: 11px; font-weight: 700; color: rgba(255,255,255,0.55); background: transparent; border: none;")
+        row.addWidget(count_lbl, alignment=Qt.AlignmentFlag.AlignTop)
+        return row
 
     def _build_about_page(self, app_icon_pixmap: Optional[QPixmap]) -> QWidget:
         page = QWidget(self)
@@ -1511,6 +1764,189 @@ class CenteredGridColumnWidget(CenteredColumnWidget):
         margins = layout.contentsMargins()
         side_margin = max(0, (self.width() - content_width) // 2)
         layout.setContentsMargins(side_margin, margins.top(), side_margin, margins.bottom())
+
+
+class RollingStatLabel(QWidget):
+    # A single line of text that "rolls" vertically into place - like an
+    # odometer digit - whenever its value changes, instead of just
+    # swapping the text instantly. Used for the artist page's "Your
+    # Stats" numbers (see _refresh_artist_your_stats), which now update
+    # live while that artist's page is open (see the hook in
+    # _maybe_log_play) rather than only once, on first opening the page.
+    #
+    # Two QLabels stacked at different y-offsets inside a fixed-height
+    # container: the old value slides up and out while the new one
+    # slides up into its place from just below - Qt clips both to this
+    # widget's own bounds for free, since a child positioned outside its
+    # parent's rect is simply not painted there.
+    def __init__(self, parent=None, object_name: str = "", height: int = 26, width: Optional[int] = None,
+                 auto_width: bool = False,
+                 alignment: Qt.AlignmentFlag = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter):
+        super().__init__(parent)
+        self.setFixedHeight(height)
+        self._auto_width = auto_width
+        if width is not None:
+            # Used for a lone full-width stat (e.g. the "Plays" tile) -
+            # not used together with auto_width, which manages its own
+            # width instead (see set_value).
+            self.setFixedWidth(width)
+        self._current_text = ""
+        self._anim_group: Optional[QParallelAnimationGroup] = None
+
+        self._front_label = QLabel("", self)
+        self._back_label = QLabel("", self)
+        for label in (self._front_label, self._back_label):
+            if object_name:
+                label.setObjectName(object_name)
+            label.setAlignment(alignment)
+            label.setGeometry(0, 0, 0, height)
+        self._back_label.hide()
+
+    def _content_width(self, text: str) -> int:
+        return QFontMetrics(self._front_label.font()).horizontalAdvance(text) + 2
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._front_label.resize(self.width(), self.height())
+        if not self._back_label.isVisible():
+            self._back_label.resize(self.width(), self.height())
+
+    def set_value(self, text: str, animate: bool = True):
+        if text == self._current_text:
+            return
+        had_previous_value = bool(self._current_text)
+        previous_text = self._current_text
+        self._current_text = text
+
+        # Finalizes anything already mid-flight rather than layering a
+        # new roll on top of one that hasn't finished - QAbstractAnimation
+        # .stop() doesn't emit finished(), so without manually forcing
+        # the same front/back swap _on_roll_finished normally does, an
+        # interrupted roll would leave the front label stuck showing a
+        # stale value forever (its swap never happens) every time a new
+        # value arrives faster than the previous roll's 320ms. Done
+        # before any width change below so _front_label/_back_label are
+        # already settled by the time this resizes them.
+        if self._anim_group is not None:
+            self._anim_group.stop()
+            self._anim_group = None
+            self._on_roll_finished()
+
+        if self._auto_width:
+            # Keeps this roller's box exactly as wide as whatever it's
+            # actually showing (widest of the outgoing/incoming value
+            # while a roll is in flight, so neither gets clipped mid-
+            # transition) - a fixed guess-sized box instead leaves an
+            # awkward, uneven gap on whichever side isn't the text's
+            # alignment edge once the real digit count turns out shorter
+            # than the guess. Used by RollingDurationLabel, which sits
+            # these between static "hr"/"min" labels on both sides.
+            needed = self._content_width(text)
+            if had_previous_value and animate:
+                needed = max(needed, self._content_width(previous_text))
+            self.setFixedWidth(needed)
+
+        if not had_previous_value or not animate:
+            # Nothing to transition from yet (first time this artist's
+            # stats have ever loaded) - or the caller explicitly asked
+            # for no animation - so just show it directly.
+            self._front_label.setText(text)
+            self._front_label.move(0, 0)
+            self._back_label.hide()
+            return
+
+        height = self.height()
+        self._back_label.setText(text)
+        self._back_label.setGeometry(0, height, self.width(), height)
+        self._back_label.show()
+
+        outgoing = QPropertyAnimation(self._front_label, b"pos", self)
+        outgoing.setDuration(320)
+        outgoing.setStartValue(QPoint(0, 0))
+        outgoing.setEndValue(QPoint(0, -height))
+        outgoing.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+        incoming = QPropertyAnimation(self._back_label, b"pos", self)
+        incoming.setDuration(320)
+        incoming.setStartValue(QPoint(0, height))
+        incoming.setEndValue(QPoint(0, 0))
+        incoming.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+        group = QParallelAnimationGroup(self)
+        group.addAnimation(outgoing)
+        group.addAnimation(incoming)
+        group.finished.connect(self._on_roll_finished)
+        self._anim_group = group
+        group.start()
+
+    def _on_roll_finished(self):
+        # The label that just rolled in becomes "front" (parked at
+        # y=0); the old one is recycled as the next round's "back"
+        # label, hidden and ready to roll in from below again next time.
+        self._front_label, self._back_label = self._back_label, self._front_label
+        self._back_label.hide()
+        self._back_label.move(0, self.height())
+        self._anim_group = None
+
+
+class RollingDurationLabel(QWidget):
+    # Compound "X hr Y min" (or just "Y min" under an hour) duration
+    # display where the hours and minutes segments roll independently
+    # (each is its own RollingStatLabel) - so a minutes-only change
+    # (39 -> 40) only animates the minutes digits, not an unchanged
+    # hours number sliding along with it for no real reason. Used for
+    # the artist page's live "Time Listened" tile.
+    def __init__(self, parent=None, object_name: str = "", height: int = 26):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(3)
+
+        # Each roller sizes its own box to exactly fit whatever digits
+        # it's currently showing (see RollingStatLabel's auto_width) -
+        # a fixed guess-sized box was leaving an uneven, awkward gap on
+        # one side or the other any time the real digit count came in
+        # shorter than the guess.
+        self._hours_roller = RollingStatLabel(self, object_name=object_name, height=height, auto_width=True)
+        self._hours_unit = QLabel("hr", self)
+        if object_name:
+            self._hours_unit.setObjectName(object_name)
+        self._minutes_roller = RollingStatLabel(self, object_name=object_name, height=height, auto_width=True)
+        self._minutes_unit = QLabel("min", self)
+        if object_name:
+            self._minutes_unit.setObjectName(object_name)
+
+        layout.addWidget(self._hours_roller)
+        layout.addWidget(self._hours_unit)
+        layout.addWidget(self._minutes_roller)
+        layout.addWidget(self._minutes_unit)
+        layout.addStretch(1)
+
+        self._hours_roller.hide()
+        self._hours_unit.hide()
+        self._has_hours = False
+
+    def set_duration_ms(self, total_ms: int, animate: bool = True):
+        total_seconds = total_ms // 1000
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+
+        show_hours = hours > 0
+        if show_hours != self._has_hours:
+            # Whether the hours segment appears at all just changed
+            # (crossing from 59 to 60 minutes, or the very first display
+            # for this artist) - there's no sensible "previous value" to
+            # roll from in either case, so this one transition is always
+            # instant; only ordinary minute-to-minute (or hour-to-hour)
+            # ticks from here on actually animate.
+            self._hours_roller.set_value(str(hours), animate=False)
+            self._hours_roller.setVisible(show_hours)
+            self._hours_unit.setVisible(show_hours)
+            self._has_hours = show_hours
+        elif show_hours:
+            self._hours_roller.set_value(str(hours), animate=animate)
+
+        self._minutes_roller.set_value(str(minutes), animate=animate)
 
 
 class AutoHeightIconGrid(ControlledScrollListWidget):
@@ -2104,12 +2540,19 @@ class AlbumCardWidget(QWidget):
     clicked = pyqtSignal()
     doubleClicked = pyqtSignal()
     rightClicked = pyqtSignal()
+    # Emitted only for a playlist card (see dropEvent below) with the raw
+    # QUrl list from the drop - resolving those into actual audio file
+    # paths is the main window's job (_resolve_dropped_audio_paths), same
+    # division of responsibility as every other AlbumCardWidget signal:
+    # this widget just reports what happened, never touches app state.
+    filesDropped = pyqtSignal(list)
 
     def __init__(self, pixmap: QPixmap, title: str, artist: str, parent=None, card_size: QSize = CARD_SIZE, is_mix: bool = False):
         super().__init__(parent)
         self.setFixedSize(card_size)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        self.setAcceptDrops(True)
 
         self.mode = "album"
         self.album_key: Optional[str] = None
@@ -2452,6 +2895,33 @@ class AlbumCardWidget(QWidget):
         if event.button() == Qt.MouseButton.LeftButton:
             self.doubleClicked.emit()
         super().mouseDoubleClickEvent(event)
+
+    # Dropping files directly onto a playlist card adds them to that
+    # playlist - only playlist cards (mode == "playlist") opt in; a drag
+    # that isn't accepted here bubbles up to the main window's own
+    # dragEnterEvent/dropEvent instead (Qt's normal behavior for a widget
+    # that ignores the event), which queues the files instead.
+    def dragEnterEvent(self, event):
+        if self.mode == "playlist" and event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            self._hovered = True
+            self.update()
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event):
+        self._hovered = False
+        self.update()
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event):
+        if self.mode == "playlist" and event.mimeData().hasUrls():
+            self.filesDropped.emit(event.mimeData().urls())
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+        self._hovered = False
+        self.update()
 
 
 class MorphingPlayPauseButton(QPushButton):
@@ -3614,6 +4084,10 @@ class AdaptiveMusicPlayer(QMainWindow):
         except (TypeError, ValueError):
             self.initial_volume_pct = 30
         self.audio_output.setVolume(self.initial_volume_pct / 100.0)
+        # Remembers whatever the volume was right before an M-key mute, so
+        # pressing M again restores it instead of just jumping to some
+        # arbitrary fixed level.
+        self._pre_mute_volume_pct = self.initial_volume_pct or 30
 
         # Pinned albums stay at the front of the grid regardless of sort
         # order, so a favorite never ends up buried a long scroll away.
@@ -3665,6 +4139,61 @@ class AdaptiveMusicPlayer(QMainWindow):
         self.resume_save_timer = QTimer(self)
         self.resume_save_timer.setInterval(10000)
         self.resume_save_timer.timeout.connect(self._save_resume_state)
+
+        # path -> duration in milliseconds, read once via mutagen and
+        # cached for the rest of the session - the Playlist Tracks view is
+        # the only place that needs a track's duration up front (without
+        # it ever having been played), and re-parsing every file's header
+        # on each visit would be wasteful for a playlist you open often.
+        # Declared here (rather than down with the rest of the playlist/
+        # grid state below) because _load_listening_time()'s one-time
+        # backfill, right below, calls _track_duration_ms() and needs
+        # this cache to already exist.
+        self._track_duration_cache: dict[str, int] = {}
+
+        # Real, exact elapsed-listening-time per track (path -> ms
+        # actually heard, all-time) - deliberately separate from play
+        # COUNT (see _maybe_log_play's 30-second/half-track threshold),
+        # which stays discrete and threshold-gated for everything else
+        # in the app (Statistics, Jump Back In, etc). This is a
+        # continuous, second-by-second ledger instead, and is what the
+        # artist page's live "Time Listened" ticker
+        # (_accumulate_listening_time/_tick_live_artist_listening_time)
+        # and get_artist_stats() are both built from - loaded once here,
+        # saved alongside resume state (see _save_resume_state) so it
+        # survives a crash the same tolerant way resume position does.
+        self.track_listening_ms: dict = self._load_listening_time()
+        self._listening_time_dirty = False
+        self._listening_time_last_position: Optional[int] = None
+        self._listening_time_last_path: Optional[str] = None
+        # Genuine accumulated listening time for whichever track is
+        # currently playing, this playthrough only - reset to 0 on every
+        # track change (see play_track_at). This, not raw playback
+        # position, is what _maybe_log_play checks before counting a
+        # "play" - so jumping straight past the 30-second mark via a
+        # seek the moment a track starts doesn't count as a play the
+        # way it used to; only actually listening that long does.
+        self._current_track_elapsed_listened_ms = 0
+        # The running baseline _tick_live_artist_listening_time adds
+        # onto for whichever track is currently playing, and how much of
+        # that total is this track's own delta since the baseline was
+        # last refreshed (see _refresh_artist_your_stats) - both reset
+        # on every track change.
+        self._artist_live_listening_baseline_ms = 0
+        self._artist_live_listening_delta_ms = 0
+
+        # Sleep timer - a plain single-shot QTimer for the minute-based
+        # options ("15 minutes", "1 hour", ...); "End of current track"
+        # instead just sets _sleep_at_track_end and is handled directly in
+        # handle_media_status() when EndOfMedia is reached, since there's
+        # no fixed duration to time out on. Session-only, deliberately not
+        # persisted to settings - a sleep timer that silently resumed
+        # counting down from a past session on next launch would be
+        # surprising, not helpful.
+        self._sleep_timer = QTimer(self)
+        self._sleep_timer.setSingleShot(True)
+        self._sleep_timer.timeout.connect(self._pause_for_sleep_timer)
+        self._sleep_at_track_end = False
 
         # --- State ---------------------------------------------------------
         # Whether the Home shelves (Jump Back In, Made For You, Recently
@@ -3719,12 +4248,6 @@ class AdaptiveMusicPlayer(QMainWindow):
         # that view no longer routes through the Library page's track
         # panel at all.
         self.playlist_detail_key: Optional[str] = None
-        # path -> duration in milliseconds, read once via mutagen and
-        # cached for the rest of the session - the Playlist Tracks view is
-        # the only place that needs a track's duration up front (without
-        # it ever having been played), and re-parsing every file's header
-        # on each visit would be wasteful for a playlist you open often.
-        self._track_duration_cache: dict[str, int] = {}
         self.grid_mode = "album"
         # Set while the Library page's album grid is showing one
         # artist's albums only (via Artist view -> click an artist), so
@@ -3974,8 +4497,28 @@ class AdaptiveMusicPlayer(QMainWindow):
         container.setLayout(master_layout)
         self.setCentralWidget(container)
 
+        # Lets dragging audio files/folders in from outside the app reach
+        # dragEnterEvent/dropEvent below - see _resolve_dropped_audio_paths
+        # for what counts as a valid drop.
+        self.setAcceptDrops(True)
+
         QShortcut(QKeySequence(Qt.Key.Key_Space), self, activated=self.toggle_play)
         QShortcut(QKeySequence(Qt.Key.Key_Tab), self, activated=self.toggle_showcase_view)
+
+        # Playback shortcuts: seek, volume, track skip, and mute - global,
+        # the same as Space/Tab above. Safe to bind globally because almost
+        # every widget in this app is NoFocus (see all the setFocusPolicy
+        # calls) - the search box is the only real exception, and Qt's own
+        # shortcut-override handling there already lets typing (including
+        # arrow-key cursor movement and spaces) through untouched, the same
+        # reason Space above never breaks typing a search query.
+        QShortcut(QKeySequence(Qt.Key.Key_Left), self, activated=lambda: self._seek_by(-5000))
+        QShortcut(QKeySequence(Qt.Key.Key_Right), self, activated=lambda: self._seek_by(5000))
+        QShortcut(QKeySequence(Qt.Key.Key_Up), self, activated=lambda: self._adjust_volume_by(5))
+        QShortcut(QKeySequence(Qt.Key.Key_Down), self, activated=lambda: self._adjust_volume_by(-5))
+        QShortcut(QKeySequence("Ctrl+Left"), self, activated=self.play_previous)
+        QShortcut(QKeySequence("Ctrl+Right"), self, activated=self.play_next)
+        QShortcut(QKeySequence(Qt.Key.Key_M), self, activated=self.toggle_mute)
 
         # Backs _crossfade_window() - a plain QLabel showing a frozen
         # snapshot of the window right before something's about to
@@ -4136,6 +4679,25 @@ class AdaptiveMusicPlayer(QMainWindow):
         self.options_menu.addAction(self.chromecast_action)
         # ============================
 
+        # === SLEEP TIMER SUBMENU ===
+        # Same checkable-QActionGroup pattern as show_playlist_sort_menu -
+        # exactly one option checked at a time, "Off" by default.
+        sleep_menu = self.options_menu.addMenu("\U0001F319 Sleep Timer")
+        self._sleep_timer_group = QActionGroup(self)
+        self._sleep_timer_group.setExclusive(True)
+        self._sleep_timer_actions = {}
+        for label, option in (
+            ("Off", None), ("15 minutes", 15), ("30 minutes", 30),
+            ("45 minutes", 45), ("1 hour", 60), ("End of current track", "track_end"),
+        ):
+            action = QAction(label, self, checkable=True)
+            action.setChecked(option is None)
+            action.triggered.connect(lambda checked=False, o=option: self.set_sleep_timer(o))
+            self._sleep_timer_group.addAction(action)
+            sleep_menu.addAction(action)
+            self._sleep_timer_actions[option] = action
+        # ============================
+
         self.options_menu.addSeparator()
         self.settings_action = QAction("Settings...", self)
         self.settings_action.triggered.connect(self.open_settings_dialog)
@@ -4220,17 +4782,6 @@ class AdaptiveMusicPlayer(QMainWindow):
             layout.addWidget(btn)
             self.tab_buttons[index] = btn
 
-        # Two upcoming, not-yet-built features get a preview slot right
-        # next to Playlists rather than waiting to appear until they're
-        # actually shipped - LRC Grab (lyric-file fetching) and Picard
-        # (a simplified MusicBrainz Picard-style tagger). Neither is a
-        # real tab: they don't belong in tab_buttons/switch_top_level_tab
-        # at all, just a dimmed pill that explains itself on click/hover
-        # instead of silently doing nothing.
-        layout.addSpacing(10)
-        for label in ("LRC Grab", "Picard"):
-            layout.addWidget(self._build_soon_nav_item(bar, label))
-
         layout.addStretch(1)
 
         self._nav_tab_bar_effect = QGraphicsOpacityEffect(bar)
@@ -4238,36 +4789,6 @@ class AdaptiveMusicPlayer(QMainWindow):
         bar.setGraphicsEffect(self._nav_tab_bar_effect)
 
         return bar
-
-    def _build_soon_nav_item(self, bar: QWidget, label_text: str) -> QWidget:
-        # A real QPushButton (so it still gets hover feedback and a click
-        # response) paired with a small "SOON" pill, visually distinct
-        # from the actual peer tabs next to it - same idea as the pin-star
-        # badge on an AlbumCardWidget (a separate child QLabel layered
-        # alongside, not baked into the button's own text/style).
-        container = QWidget(bar)
-        row = QHBoxLayout(container)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(5)
-
-        btn = QPushButton(label_text, container)
-        btn.setObjectName("NavTabButtonSoon")
-        btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        btn.setToolTip(f"{label_text} \u2014 coming soon")
-        btn.clicked.connect(lambda checked=False, name=label_text: self._show_coming_soon(name))
-        row.addWidget(btn)
-
-        soon_badge = QLabel("SOON", container)
-        soon_badge.setObjectName("SoonBadge")
-        soon_badge.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        row.addWidget(soon_badge, alignment=Qt.AlignmentFlag.AlignVCenter)
-
-        return container
-
-    def _show_coming_soon(self, feature_name: str):
-        self.status_label.setText(f"{feature_name} is coming soon \u2014 working on it next!")
-        self.status_label.setVisible(True)
 
     def _set_nav_tab_bar_visible(self, visible: bool):
         # Opacity, not setVisible() - setVisible removes the bar from
@@ -4479,9 +5000,12 @@ class AdaptiveMusicPlayer(QMainWindow):
     _FORGOTTEN_RECENT_WINDOW_DAYS = 30
     _FORGOTTEN_RECENT_MAX_PLAYS = 1
 
-    # Jump Back In looks at real, recent listening (not the generated
-    # mixes below) over this window to decide what counts as "recent".
-    JUMP_BACK_IN_WINDOW_DAYS = 7
+    # Jump Back In looks at your real listening across the whole play-
+    # history log, not just some recent window - nothing in here ever
+    # "expires" out of the log itself, so this only ever surfaces less
+    # once something genuinely more recent/heavier bumps it, not just
+    # because a day passed. JUMP_BACK_IN_LIMIT below is what actually
+    # keeps the bar from growing without bound.
     JUMP_BACK_IN_LIMIT = 15
     # A track needs at least this many plays in the window to surface on
     # its own as a singular-track card (as opposed to just being part of
@@ -4516,7 +5040,6 @@ class AdaptiveMusicPlayer(QMainWindow):
         #
         # Returns a list of dicts: {"mode": "track"|"album"|"playlist",
         # "album_key", "track_path" (only for "track")}.
-        since_ts = int(time.time()) - self.JUMP_BACK_IN_WINDOW_DAYS * 86400
 
         # album_key -> {track_path: [play ts, ...]} for real, still-
         # scanned albums only - a play logged under a synthetic mix key
@@ -4533,7 +5056,7 @@ class AdaptiveMusicPlayer(QMainWindow):
         # context_key at all, so it only ever shows up in the dict above.
         album_track_plays: dict[str, dict[str, list]] = {}
         context_track_plays: dict[str, dict[str, list]] = {}
-        for record in self.get_recent_plays(since_ts=since_ts):
+        for record in self.get_recent_plays():
             path = record.get("path")
             ts = record.get("ts")
             if not path or ts is None or not os.path.exists(path):
@@ -4859,6 +5382,87 @@ class AdaptiveMusicPlayer(QMainWindow):
             self._refresh_now_playing_outlines(force=True)
             self._refresh_playlist_detail_play_button()
 
+    def export_playlist_as_m3u(self, playlist_id: str):
+        record = self.user_playlists.get(playlist_id)
+        if not record:
+            return
+        track_paths = record.get("track_paths", [])
+        if not track_paths:
+            self.status_label.setText("Nothing to export \u2014 this playlist is empty")
+            self.status_label.setVisible(True)
+            return
+
+        # Same handful of characters QFileDialog's own save dialog would
+        # reject in a filename anyway - just swapped for underscores up
+        # front so the suggested name doesn't get silently mangled.
+        default_name = re.sub(r'[\\/:"*?<>|]+', "_", record["name"]).strip() or "Playlist"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Playlist", f"{default_name}.m3u8", "M3U Playlist (*.m3u8 *.m3u)"
+        )
+        if not path:
+            return
+
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("#EXTM3U\n")
+                for track_path in track_paths:
+                    title = self.get_track_title(track_path)
+                    artist, _album, _year, _cover = read_track_tags(track_path)
+                    # -1 is the standard M3U convention for "duration not
+                    # given" - actually measuring every track's runtime
+                    # just for this cosmetic header would mean loading
+                    # each file a second time for no real benefit, since
+                    # most players (including RoPlayer) read a track's
+                    # real duration from the file itself once it's queued.
+                    f.write(f"#EXTINF:-1,{artist} - {title}\n")
+                    f.write(f"{track_path}\n")
+            self.status_label.setText(f"Exported \u201c{record['name']}\u201d to {os.path.basename(path)}")
+        except OSError as e:
+            self.status_label.setText(f"Couldn't export playlist: {e}")
+        self.status_label.setVisible(True)
+
+    def import_playlist_from_m3u(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import Playlist", "", "M3U Playlist (*.m3u8 *.m3u)"
+        )
+        if not path:
+            return
+
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+        except OSError as e:
+            self.status_label.setText(f"Couldn't read that file: {e}")
+            self.status_label.setVisible(True)
+            return
+
+        # M3U entries are usually relative to the playlist file's own
+        # folder (that's how e.g. Winamp/foobar2000/VLC all write them),
+        # not to whatever folder RoPlayer's own library happens to be
+        # scanning - resolved against playlist_dir rather than assumed to
+        # already be absolute, or a playlist made elsewhere would import
+        # as a list of tracks that don't exist anywhere.
+        playlist_dir = os.path.dirname(path)
+        track_paths = []
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue  # blank line or a directive (#EXTM3U, #EXTINF, ...)
+            candidate = line if os.path.isabs(line) else os.path.normpath(os.path.join(playlist_dir, line))
+            if os.path.isfile(candidate) and os.path.splitext(candidate)[1].lower() in SUPPORTED_EXTENSIONS:
+                track_paths.append(candidate)
+
+        if not track_paths:
+            self.status_label.setText("No playable tracks found in that M3U file")
+            self.status_label.setVisible(True)
+            return
+
+        name = os.path.splitext(os.path.basename(path))[0]
+        self.create_playlist(name, track_paths)
+        noun = "track" if len(track_paths) == 1 else "tracks"
+        self.status_label.setText(f"Imported \u201c{name}\u201d with {len(track_paths)} {noun}")
+        self.status_label.setVisible(True)
+
     def add_tracks_to_playlist(self, playlist_id: str, track_paths: list):
         record = self.user_playlists.get(playlist_id)
         if not record:
@@ -4888,6 +5492,24 @@ class AdaptiveMusicPlayer(QMainWindow):
         if not record or not (0 <= row < len(record["track_paths"])):
             return
         del record["track_paths"][row]
+        self._save_user_playlists()
+        self._sync_user_playlists_into_library()
+        self.rebuild_playlist_grid()
+        if self.browsing_album_key == self._playlist_key(playlist_id):
+            self.display_album_tracks_by_key(self.browsing_album_key)
+        self._refresh_playlist_detail_if_open(self._playlist_key(playlist_id))
+
+    def remove_tracks_from_playlist_at_rows(self, playlist_id: str, rows: list):
+        # Batch version of remove_track_from_playlist_at, for the song
+        # list's multi-select "Remove N from Playlist" action - removed
+        # highest index first so deleting one row never shifts what a
+        # still-pending index further down the list actually points to.
+        record = self.user_playlists.get(playlist_id)
+        if not record:
+            return
+        for row in sorted(set(rows), reverse=True):
+            if 0 <= row < len(record["track_paths"]):
+                del record["track_paths"][row]
         self._save_user_playlists()
         self._sync_user_playlists_into_library()
         self.rebuild_playlist_grid()
@@ -5352,6 +5974,13 @@ class AdaptiveMusicPlayer(QMainWindow):
         header_row.addWidget(self.playlist_sort_btn, alignment=Qt.AlignmentFlag.AlignVCenter)
         self._update_playlist_sort_button_text()
 
+        self.import_playlist_btn = QPushButton("Import M3U...", page)
+        self.import_playlist_btn.setObjectName("PlaylistSortButton")
+        self.import_playlist_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.import_playlist_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.import_playlist_btn.clicked.connect(self.import_playlist_from_m3u)
+        header_row.addWidget(self.import_playlist_btn, alignment=Qt.AlignmentFlag.AlignVCenter)
+
         self.new_playlist_btn = QPushButton("+  New Playlist", page)
         self.new_playlist_btn.setObjectName("NewPlaylistButton")
         self.new_playlist_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -5495,6 +6124,7 @@ class AdaptiveMusicPlayer(QMainWindow):
             # click anymore.
             card.doubleClicked.connect(lambda k=key: self.handle_playlist_card_clicked(k))
             card.rightClicked.connect(lambda c=card: self.show_playlist_card_context_menu(c))
+            card.filesDropped.connect(lambda urls, pid=playlist_id: self.handle_files_dropped_on_playlist(pid, urls))
             self.playlist_grid.setItemWidget(item, card)
 
             if key == self.active_playing_album_key:
@@ -5563,6 +6193,11 @@ class AdaptiveMusicPlayer(QMainWindow):
             remove_cover_action = QAction("Remove Cover Image", self)
             remove_cover_action.triggered.connect(lambda checked=False, pid=playlist_id: self.clear_playlist_cover_image(pid))
             menu.addAction(remove_cover_action)
+        menu.addSeparator()
+        export_action = QAction("Export as M3U...", self)
+        export_action.triggered.connect(lambda checked=False, pid=playlist_id: self.export_playlist_as_m3u(pid))
+        menu.addAction(export_action)
+        menu.addSeparator()
         delete_action = QAction("Delete", self)
         delete_action.triggered.connect(lambda checked=False, pid=playlist_id: self.prompt_delete_playlist(pid))
         menu.addAction(delete_action)
@@ -5679,6 +6314,7 @@ class AdaptiveMusicPlayer(QMainWindow):
             cached_photo, artist_name, size=ARTIST_DETAIL_PHOTO_SIZE
         )
         self.artist_detail_photo.setPixmap(photo_pixmap)
+        self._apply_artist_banner_backdrop(photo_pixmap)
 
         # Blank/hidden rather than "Loading..." placeholders - these
         # populate asynchronously via _on_artist_info_fetched, and a
@@ -5712,7 +6348,52 @@ class AdaptiveMusicPlayer(QMainWindow):
                 fetch_top_tracks=top_tracks_needed, fetch_top_albums=top_albums_needed,
             )
 
+        # This person's own listening with this artist - entirely local,
+        # nothing to fetch or wait on, unlike everything above.
+        self._refresh_artist_your_stats(artist_name)
+
         self.artist_filter_banner.setVisible(True)
+
+    def _refresh_artist_your_stats(self, artist_name: str, animate: bool = False):
+        stats = self.get_artist_stats(artist_name)
+        if not stats["total_plays"] and not stats["total_listening_ms"]:
+            # Genuinely nothing yet - not even a few seconds of a track
+            # that got skipped before counting as a full "play" (see
+            # get_artist_stats' docstring on why these two are checked
+            # separately rather than just total_plays).
+            self.artist_detail_stats_card.setVisible(False)
+            return
+        self.artist_detail_stats_card.setVisible(True)
+        self.artist_detail_plays_value.set_value(str(stats["total_plays"]), animate=animate)
+        self.artist_detail_time_value.set_duration_ms(stats["total_listening_ms"], animate=animate)
+        if stats["first_played_ts"]:
+            since_text = time.strftime("%b %Y", time.localtime(stats["first_played_ts"]))
+            self.artist_detail_since_label.setText(f"Listening since {since_text}")
+        else:
+            self.artist_detail_since_label.setText("")
+        # Baseline the live per-tick ticker (_tick_live_artist_listening_
+        # time) builds on top of for whatever's playing right now - reset
+        # to 0 here since this fresh total already reflects everything
+        # counted so far, including the currently-playing track's own
+        # listening_ms up to this exact moment.
+        self._artist_live_listening_baseline_ms = stats["total_listening_ms"]
+        self._artist_live_listening_delta_ms = 0
+
+    def _maybe_refresh_live_artist_stats(self, played_album_key: Optional[str]):
+        # Called right after a play is logged (see _maybe_log_play) -
+        # if the artist page currently open happens to belong to the
+        # same artist that track came from, its "Your Stats" card rolls
+        # to the new numbers immediately (see RollingStatLabel) instead
+        # of only catching up the next time the page happens to be
+        # reopened.
+        if not self.artist_filter_name or not played_album_key:
+            return
+        meta = self.album_display_meta.get(played_album_key)
+        if not meta:
+            return
+        if primary_artist_name(meta.get("artist", "")).lower() != primary_artist_name(self.artist_filter_name).lower():
+            return
+        self._refresh_artist_your_stats(self.artist_filter_name, animate=True)
 
     def clear_artist_filter(self):
         self.artist_filter_name = None
@@ -6164,6 +6845,33 @@ class AdaptiveMusicPlayer(QMainWindow):
                 return self.make_pixmap_rounded(square, radius=size // 2)
         return self.generate_artist_avatar_pixmap(name, size=size)
 
+    def _apply_artist_banner_backdrop(self, pixmap: QPixmap):
+        # A soft per-widget gradient wash behind the artist hero banner,
+        # tinted from that artist's own photo - reuses the same
+        # compute_average_color() the track-playback theme uses, but
+        # applied only to this one widget's own stylesheet rather than
+        # going through apply_theme(), which would recolor the entire
+        # app just because someone's browsing an artist rather than
+        # actually playing something. Purely decorative - never touches
+        # self._current_accent.
+        base = self.compute_average_color(pixmap)
+        # Lightened copy for the gradient's far edge - a single flat
+        # color read as a plain background fill rather than the subtle
+        # "glow behind a portrait" look a hero banner wants.
+        edge = QColor(
+            min(255, base.red() + 14), min(255, base.green() + 14), min(255, base.blue() + 18)
+        )
+        self.artist_filter_banner.setStyleSheet(f"""
+            QWidget#ArtistHeroBanner {{
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:0.6,
+                    stop:0 {edge.name()}, stop:1 {base.name()}
+                );
+                border-radius: 16px;
+                border: 1px solid rgba(255,255,255,0.06);
+            }}
+        """)
+
     def _kick_off_artist_image_fetch(self, groups: list):
         # Only actually reaches the network for artists that don't
         # already have a cached photo on disk - most launches after the
@@ -6205,6 +6913,7 @@ class AdaptiveMusicPlayer(QMainWindow):
         if self.artist_filter_name == name:
             detail_pixmap = self.artist_image_bytes_to_pixmap(image_bytes, name, size=ARTIST_DETAIL_PHOTO_SIZE)
             self.artist_detail_photo.setPixmap(detail_pixmap)
+            self._apply_artist_banner_backdrop(detail_pixmap)
 
     def _on_artist_image_fetch_finished(self):
         self._artist_image_fetcher = None
@@ -6231,22 +6940,26 @@ class AdaptiveMusicPlayer(QMainWindow):
         # Artist view -> click an artist - see filter_library_by_artist).
         # "Clear" returns to the normal, unfiltered library grid. Built up
         # front here; populated per-artist by filter_library_by_artist()
-        # and the async fetch callbacks below it.
+        # and the async fetch callbacks below it. The background itself
+        # isn't set here - see _apply_artist_banner_backdrop, which tints
+        # it fresh from each artist's own photo every time this is shown.
         self.artist_filter_banner = QWidget(self)
+        self.artist_filter_banner.setObjectName("ArtistHeroBanner")
         artist_detail_layout = QVBoxLayout(self.artist_filter_banner)
-        artist_detail_layout.setContentsMargins(2, 2, 2, 16)
+        artist_detail_layout.setContentsMargins(20, 18, 20, 20)
         artist_detail_layout.setSpacing(10)
 
         detail_top_row = QHBoxLayout()
-        detail_top_row.setSpacing(16)
+        detail_top_row.setSpacing(20)
 
         self.artist_detail_photo = QLabel(self)
+        self.artist_detail_photo.setObjectName("ArtistDetailPhoto")
         self.artist_detail_photo.setFixedSize(ARTIST_DETAIL_PHOTO_SIZE, ARTIST_DETAIL_PHOTO_SIZE)
         self.artist_detail_photo.setScaledContents(True)
         detail_top_row.addWidget(self.artist_detail_photo, alignment=Qt.AlignmentFlag.AlignTop)
 
         detail_info_col = QVBoxLayout()
-        detail_info_col.setSpacing(4)
+        detail_info_col.setSpacing(6)
 
         detail_name_row = QHBoxLayout()
         self.artist_filter_label = QLabel("", self)
@@ -6284,10 +6997,56 @@ class AdaptiveMusicPlayer(QMainWindow):
         # to several paragraphs, which would push the album grid below
         # much further down than makes sense for what's meant to be a
         # short "mini biography", not the whole thing.
-        self.artist_detail_bio_label.setMaximumHeight(78)
+        self.artist_detail_bio_label.setMaximumHeight(84)
         detail_info_col.addWidget(self.artist_detail_bio_label)
 
         detail_top_row.addLayout(detail_info_col, stretch=1)
+
+        # "Your Stats" - this person's own listening with this specific
+        # artist (see get_artist_stats), not anything from Last.fm. Sits
+        # on a slightly darkened overlay of its own so it stays readable
+        # regardless of what color _apply_artist_banner_backdrop happens
+        # to tint the banner itself. Hidden whenever there's nothing to
+        # show yet (an artist with zero logged plays) - see
+        # _refresh_artist_your_stats.
+        self.artist_detail_stats_card = QWidget(self)
+        self.artist_detail_stats_card.setObjectName("ArtistYourStatsCard")
+        self.artist_detail_stats_card.setFixedWidth(168)
+        stats_card_layout = QVBoxLayout(self.artist_detail_stats_card)
+        stats_card_layout.setContentsMargins(14, 12, 14, 12)
+        stats_card_layout.setSpacing(2)
+
+        stats_card_heading = QLabel("YOUR STATS", self.artist_detail_stats_card)
+        stats_card_heading.setObjectName("ArtistYourStatsHeading")
+        stats_card_layout.addWidget(stats_card_heading)
+        stats_card_layout.addSpacing(4)
+
+        self.artist_detail_plays_value = RollingStatLabel(self.artist_detail_stats_card, object_name="ArtistYourStatsValue")
+        self.artist_detail_plays_caption = QLabel("Plays", self.artist_detail_stats_card)
+        self.artist_detail_plays_caption.setObjectName("ArtistYourStatsCaption")
+        stats_card_layout.addWidget(self.artist_detail_plays_value)
+        stats_card_layout.addWidget(self.artist_detail_plays_caption)
+
+        stats_divider = QFrame(self.artist_detail_stats_card)
+        stats_divider.setFrameShape(QFrame.Shape.HLine)
+        stats_divider.setStyleSheet("background-color: rgba(255,255,255,0.1); border: none; max-height: 1px; margin: 6px 0px;")
+        stats_card_layout.addWidget(stats_divider)
+
+        self.artist_detail_time_value = RollingDurationLabel(self.artist_detail_stats_card, object_name="ArtistYourStatsValue")
+        self.artist_detail_time_caption = QLabel("Time listened", self.artist_detail_stats_card)
+        self.artist_detail_time_caption.setObjectName("ArtistYourStatsCaption")
+        stats_card_layout.addWidget(self.artist_detail_time_value)
+        stats_card_layout.addWidget(self.artist_detail_time_caption)
+
+        self.artist_detail_since_label = QLabel("", self.artist_detail_stats_card)
+        self.artist_detail_since_label.setObjectName("ArtistYourStatsSince")
+        self.artist_detail_since_label.setWordWrap(True)
+        stats_card_layout.addSpacing(6)
+        stats_card_layout.addWidget(self.artist_detail_since_label)
+
+        self.artist_detail_stats_card.setVisible(False)
+        detail_top_row.addWidget(self.artist_detail_stats_card, alignment=Qt.AlignmentFlag.AlignTop)
+
         artist_detail_layout.addLayout(detail_top_row)
         self.artist_filter_banner.setVisible(False)
 
@@ -6426,6 +7185,16 @@ class AdaptiveMusicPlayer(QMainWindow):
         self.album_heading.setObjectName("AlbumHeading")
         
         self.song_list_widget = NowPlayingListWidget(self)
+        self.song_list_widget.setObjectName("SongListWidget")
+        # Ctrl/Shift-click to select several tracks at once, so the bulk
+        # "Play Next"/"Add to Queue"/"Add to Playlist" actions in
+        # _show_song_list_context_menu below have more than one row to act
+        # on. A plain click still just selects (and, via
+        # handle_song_list_item_clicked, opens Showcase if it happens to
+        # land on the now-playing row) - only a double-click plays a
+        # track, so turning this on doesn't change what a normal click
+        # does.
+        self.song_list_widget.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.song_list_widget.itemClicked.connect(self.handle_song_list_item_clicked)
         self.song_list_widget.itemDoubleClicked.connect(self.play_item)
         self.song_list_widget.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
@@ -7072,6 +7841,10 @@ class AdaptiveMusicPlayer(QMainWindow):
             remove_cover_action.triggered.connect(lambda checked=False, pid=playlist_id: self.clear_playlist_cover_image(pid))
             menu.addAction(remove_cover_action)
         menu.addSeparator()
+        export_action = QAction("Export as M3U...", self)
+        export_action.triggered.connect(lambda checked=False, pid=playlist_id: self.export_playlist_as_m3u(pid))
+        menu.addAction(export_action)
+        menu.addSeparator()
         delete_action = QAction("Delete Playlist", self)
         delete_action.triggered.connect(lambda checked=False, pid=playlist_id: self.prompt_delete_playlist(pid))
         menu.addAction(delete_action)
@@ -7379,13 +8152,39 @@ class AdaptiveMusicPlayer(QMainWindow):
                 padding: 2px 2px 12px 2px;
             }}
             QLabel#ArtistDetailName {{
-                font-weight: 800; font-size: 22px; color: rgba(255,255,255,0.95);
+                font-weight: 800; font-size: 28px; color: #FFFFFF;
             }}
             QLabel#ArtistDetailStat {{
-                font-weight: 600; font-size: 12px; color: rgba(255,255,255,0.55);
+                font-weight: 600; font-size: 12px; color: rgba(255,255,255,0.65);
             }}
             QLabel#ArtistDetailBio {{
-                font-weight: 400; font-size: 12px; color: rgba(255,255,255,0.6);
+                font-weight: 400; font-size: 13px; color: rgba(255,255,255,0.75);
+            }}
+            QWidget#ArtistHeroBanner {{
+                background-color: rgba(255,255,255,0.03);
+                border: 1px solid rgba(255,255,255,0.06);
+                border-radius: 16px;
+            }}
+            QLabel#ArtistDetailPhoto {{
+                border-radius: {ARTIST_DETAIL_PHOTO_SIZE // 2}px;
+                border: 3px solid rgba(255,255,255,0.2);
+            }}
+            QWidget#ArtistYourStatsCard {{
+                background-color: rgba(0,0,0,0.24);
+                border: 1px solid rgba(255,255,255,0.1);
+                border-radius: 12px;
+            }}
+            QLabel#ArtistYourStatsHeading {{
+                font-weight: 800; font-size: 10px; color: rgba(255,255,255,0.5); letter-spacing: 0.5px;
+            }}
+            QLabel#ArtistYourStatsValue {{
+                font-weight: 800; font-size: 19px; color: #FFFFFF;
+            }}
+            QLabel#ArtistYourStatsCaption {{
+                font-weight: 600; font-size: 10px; color: rgba(255,255,255,0.5);
+            }}
+            QLabel#ArtistYourStatsSince {{
+                font-weight: 500; font-size: 10px; color: rgba(255,255,255,0.4);
             }}
             QLabel#TrendingBadge {{
                 background: transparent;
@@ -7588,28 +8387,6 @@ class AdaptiveMusicPlayer(QMainWindow):
                 border: 1px solid rgba(255, 255, 255, 0.18);
                 color: #FFFFFF;
             }}
-            QPushButton#NavTabButtonSoon {{
-                background-color: transparent;
-                border: 1px solid transparent;
-                color: rgba(255, 255, 255, 0.32);
-                border-radius: 14px;
-                padding: 6px 10px 6px 16px;
-                font-weight: 700;
-                font-size: 13px;
-            }}
-            QPushButton#NavTabButtonSoon:hover {{
-                background-color: rgba(255, 255, 255, 0.06);
-                color: rgba(255, 255, 255, 0.55);
-            }}
-            QLabel#SoonBadge {{
-                background-color: rgba(255, 255, 255, 0.08);
-                color: rgba(255, 255, 255, 0.4);
-                border-radius: 6px;
-                padding: 2px 6px;
-                font-weight: 800;
-                font-size: 9px;
-                letter-spacing: 0.5px;
-            }}
             QWidget#HomePage, QWidget#ArtistsPage, QWidget#PlaylistsPage, QWidget#QueuePage {{ background: transparent; }}
             QWidget#QueueNowPlayingCard {{
                 background-color: rgba(255, 255, 255, 0.05);
@@ -7659,6 +8436,20 @@ class AdaptiveMusicPlayer(QMainWindow):
             }}
             QListWidget::item {{ color: #FFFFFF; border: none; border-radius: 8px; padding: 6px; }}
             QListWidget::item:hover {{ background-color: {panel_hover}; }}
+
+            /* Multi-select highlight for the Library track list - styled
+               to match the app's own translucent-white language instead
+               of the OS/Fusion default selection blue, and a touch
+               stronger than plain :hover so a multi-selection stays
+               readable against NowPlayingListWidget's own animated
+               "now playing" pill (painted underneath this, in
+               paintEvent()) landing on one of the same rows. */
+            QListWidget#SongListWidget::item:selected {{
+                background-color: rgba(255, 255, 255, 0.16);
+            }}
+            QListWidget#SongListWidget::item:hover {{
+                background-color: rgba(255, 255, 255, 0.09);
+            }}
 
             QListWidget#QueueListWidget::item {{
                 padding: 0px;
@@ -8667,6 +9458,14 @@ class AdaptiveMusicPlayer(QMainWindow):
 
     def handle_song_list_item_clicked(self, item: QListWidgetItem):
         row = self.song_list_widget.row(item)
+        # A Ctrl/Shift-click is someone building a multi-selection (see
+        # ExtendedSelection above), not a request to jump into Showcase -
+        # without this check, ctrl-clicking the now-playing row as part of
+        # selecting several tracks would yank them out to Showcase mid-
+        # selection instead of just adding that row to the selection.
+        modifiers = QApplication.keyboardModifiers()
+        if modifiers & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier):
+            return
         is_now_playing_row = row == self._library_row_for_playing_track() and self.is_playing
         if is_now_playing_row:
             self.open_showcase_view()
@@ -8680,20 +9479,34 @@ class AdaptiveMusicPlayer(QMainWindow):
         item = self.song_list_widget.itemAt(pos)
         if item is None:
             return
-        row = self.song_list_widget.row(item)
-        if not (0 <= row < len(self.browsing_tracks)):
+        clicked_row = self.song_list_widget.row(item)
+        if not (0 <= clicked_row < len(self.browsing_tracks)):
             return
-        path = self.browsing_tracks[row]
+
+        # Right-clicking a row that's already part of a multi-selection
+        # (Ctrl/Shift-click - see setSelectionMode above) acts on the
+        # whole selection; right-clicking outside it collapses the
+        # selection down to just this one row first, the same as
+        # right-click behaves in most desktop file/list managers.
+        selected_rows = sorted({index.row() for index in self.song_list_widget.selectedIndexes()})
+        if clicked_row not in selected_rows:
+            self.song_list_widget.clearSelection()
+            item.setSelected(True)
+            selected_rows = [clicked_row]
+
+        rows = [r for r in selected_rows if 0 <= r < len(self.browsing_tracks)]
+        paths = [self.browsing_tracks[r] for r in rows]
 
         menu = QMenu(self)
-        self._add_queue_and_playlist_actions(menu, [path])
+        self._add_queue_and_playlist_actions(menu, paths)
 
         if self.browsing_album_key and self.browsing_album_key.startswith(self.PLAYLIST_KEY_PREFIX):
             playlist_id = self.browsing_album_key[len(self.PLAYLIST_KEY_PREFIX):]
             menu.addSeparator()
-            remove_action = QAction("Remove from Playlist", self)
+            label = "Remove from Playlist" if len(rows) == 1 else f"Remove {len(rows)} from Playlist"
+            remove_action = QAction(label, self)
             remove_action.triggered.connect(
-                lambda checked=False, pid=playlist_id, r=row: self.remove_track_from_playlist_at(pid, r)
+                lambda checked=False, pid=playlist_id, rs=rows: self.remove_tracks_from_playlist_at_rows(pid, rs)
             )
             menu.addAction(remove_action)
 
@@ -8852,6 +9665,22 @@ class AdaptiveMusicPlayer(QMainWindow):
         self.current_scrobbled = False
         self._play_logged_for_current_track = False
         self.current_track_start_ts = int(time.time())
+        # Elapsed-listening-time tracking (_accumulate_listening_time)
+        # starts fresh for every new track - carrying over the previous
+        # track's last-known position would otherwise compute one huge
+        # bogus "delta" against this track's very different starting
+        # position. If the new track happens to belong to whichever
+        # artist page is currently open, this also gives its live "Time
+        # Listened" ticker an up-to-date baseline to start ticking from.
+        self._listening_time_last_position = None
+        self._listening_time_last_path = None
+        # This playthrough hasn't accumulated any genuine listening yet -
+        # _maybe_log_play checks this, not raw position, so a resumed or
+        # skipped-to starting point doesn't get mistaken for time
+        # actually spent listening.
+        self._current_track_elapsed_listened_ms = 0
+        if self.artist_filter_name:
+            self._refresh_artist_your_stats(self.artist_filter_name, animate=False)
         session_key = self.settings.value("lfm_sk", None)
 
         # Don't ping Last.fm as "now playing" for a resumed-but-not-yet-
@@ -8871,7 +9700,11 @@ class AdaptiveMusicPlayer(QMainWindow):
         # Called on every track change, periodically while playing
         # (resume_save_timer), on pause, and on close - so a crash or
         # force-quit doesn't lose more than ~10s of progress, not just a
-        # clean exit.
+        # clean exit. Piggybacks the listening-time ledger's own save
+        # onto these exact same call sites rather than wiring up a
+        # second timer for it - it wants the same "don't lose more than
+        # ~10s of it on a crash" guarantee anyway.
+        self._save_listening_time()
         if self.current_track_index == -1 or not self.active_playing_album_key:
             return
         self.settings.setValue("resume_album_key", self.active_playing_album_key)
@@ -9510,15 +10343,98 @@ class AdaptiveMusicPlayer(QMainWindow):
         os.makedirs(data_dir, exist_ok=True)
         return os.path.join(data_dir, "play_history.jsonl")
 
-    def _maybe_log_play(self, position_ms: int):
-        # Only counts once "meaningfully listened to" - past 30 seconds or
-        # half the track, whichever is shorter - so instant-skipping
+    def _listening_time_path(self) -> str:
+        # Same app-data directory convention as _play_history_path, just
+        # a compact single JSON object (path -> cumulative ms) rather
+        # than an append-only log, since this repeatedly updates the
+        # same handful of keys instead of growing indefinitely.
+        data_dir = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)
+        if not data_dir:
+            data_dir = os.path.expanduser(os.path.join("~", ".cache", APP_NAME))
+        os.makedirs(data_dir, exist_ok=True)
+        return os.path.join(data_dir, "listening_time.json")
+
+    def _load_listening_time(self) -> dict:
+        try:
+            with open(self._listening_time_path(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+            loaded = {k: int(v) for k, v in data.items() if isinstance(v, (int, float)) and v > 0}
+        except (OSError, json.JSONDecodeError, ValueError, TypeError):
+            # Missing file (first-ever launch) or corrupt data - either
+            # way, starting from an empty ledger is the only sane
+            # fallback; there's no "partially valid" version of this to
+            # salvage.
+            loaded = {}
+
+        # One-time migration, gated on its own settings flag rather than
+        # "does listening_time.json exist" - that file can legitimately
+        # already exist with a little bit of real, precisely-tracked
+        # data (someone who played a few songs after this ledger shipped
+        # but before this backfill did), and gating on file existence
+        # would mistake that for "already migrated" and skip backfilling
+        # everything from before - see _backfill_listening_time_from_play_history.
+        if not self.settings.value("listening_time_backfilled_v1", False, type=bool):
+            loaded = self._backfill_listening_time_from_play_history(loaded)
+            self.settings.setValue("listening_time_backfilled_v1", True)
+
+        return loaded
+
+    def _backfill_listening_time_from_play_history(self, existing: dict) -> dict:
+        # Rather than starting everyone at a jarring "0 min" the moment
+        # this ledger shipped, fills in a starting estimate - duration ×
+        # play count, exactly the approximation "Time Listened" relied
+        # on everywhere before this feature - for anything that doesn't
+        # already have a real, precisely-tracked entry in `existing`.
+        # Never overwrites an entry that's already there; only adds
+        # what's missing. Real, exact tracking
+        # (_accumulate_listening_time) takes over for everything played
+        # from here on.
+        counts: dict[str, int] = {}
+        for record in self.get_recent_plays():
+            path = record.get("path")
+            if not path or path in existing or not os.path.exists(path):
+                continue
+            counts[path] = counts.get(path, 0) + 1
+        for path, count in counts.items():
+            existing[path] = self._track_duration_ms(path) * count
+        try:
+            with open(self._listening_time_path(), "w", encoding="utf-8") as f:
+                json.dump(existing, f)
+        except OSError:
+            # Non-fatal - worst case this one-time backfill just doesn't
+            # persist and quietly retries on the next launch instead.
+            pass
+        return existing
+
+    def _save_listening_time(self):
+        if not self._listening_time_dirty:
+            return
+        try:
+            with open(self._listening_time_path(), "w", encoding="utf-8") as f:
+                json.dump(self.track_listening_ms, f)
+            self._listening_time_dirty = False
+        except OSError:
+            # Non-fatal, same tolerance every other cache write in this
+            # file uses - worst case whatever accumulated since the last
+            # successful save doesn't persist.
+            pass
+
+    def _maybe_log_play(self):
+        # Only counts once "meaningfully listened to" - past 30 seconds
+        # or half the track, whichever is shorter - so instant-skipping
         # through a track doesn't pollute the data the way logging on
-        # track-start would. Gated on is_playing so a resumed-but-paused
-        # session (see _resolve_resume_target/play_track_at) doesn't
-        # immediately re-log a play just because the saved position
-        # already happened to be past the threshold - that position was
-        # already earned during a previous real listen, not this one.
+        # track-start would. Checked against actual accumulated
+        # listening time for this playthrough
+        # (_current_track_elapsed_listened_ms, built up by
+        # _accumulate_listening_time) rather than raw playback position -
+        # seeking straight to the 40-second mark the moment a track
+        # starts shouldn't count as a play any more than fast-forwarding
+        # through it would; only genuinely elapsed listening does. Gated
+        # on is_playing so a resumed-but-paused session (see
+        # _resolve_resume_target/play_track_at) doesn't immediately
+        # re-log a play just because the saved position already happened
+        # to be past the threshold - that position was already earned
+        # during a previous real listen, not this one.
         if self._play_logged_for_current_track or not self.is_playing:
             return
         if self.current_track_index == -1 or not self.active_playing_tracks:
@@ -9529,7 +10445,7 @@ class AdaptiveMusicPlayer(QMainWindow):
             return  # duration not known yet - try again on the next tick
 
         threshold_ms = min(30000, duration_ms / 2)
-        if position_ms < threshold_ms:
+        if self._current_track_elapsed_listened_ms < threshold_ms:
             return
 
         self._play_logged_for_current_track = True
@@ -9556,6 +10472,7 @@ class AdaptiveMusicPlayer(QMainWindow):
         # attribution alone can't ever show, since a mix's whole point is
         # drawing from many different albums at once.
         self._log_play(path, real_album_key, context_key=self.active_playing_album_key)
+        self._maybe_refresh_live_artist_stats(real_album_key)
         # mark_home_shelves_dirty() otherwise only ever actually recomputes
         # anything on startup, on switching to the Home tab, or on
         # pinning/unpinning an album - nothing previously re-rendered Jump
@@ -9679,6 +10596,222 @@ class AdaptiveMusicPlayer(QMainWindow):
         counts = self.get_track_play_counts(since_ts=since_ts, until_ts=until_ts)
         ranked = sorted(counts.keys(), key=lambda p: counts[p], reverse=True)
         return ranked[:limit]
+
+    def get_fun_stats(self) -> dict:
+        # Backs Settings > Statistics - a lightweight, all-time "Wrapped"-
+        # style summary. Deliberately its own single pass over
+        # get_recent_plays() (all-time, no since_ts) rather than composing
+        # the existing get_track_play_counts()/get_album_play_counts()
+        # helpers, which are built around a rolling window for the Home
+        # shelves - every number here covers the whole play_history.jsonl
+        # log, and there's no reason to walk it three separate times when
+        # one pass already has everything each count needs.
+        #
+        # Returns {"total_plays", "unique_tracks", "total_listening_ms",
+        # "tracking_since_ts", "avg_plays_per_day", "busiest_day":
+        # (display_date, count) or None, "longest_streak_days",
+        # "library_album_count", "library_artist_count",
+        # "library_track_count", "top_track"/"top_album": (title, artist,
+        # count) or None, "top_artist": (name, count) or None,
+        # "top_tracks"/"top_albums": [(title, artist, count), ...] (up to
+        # 5, ranked), "top_artists": [(name, count), ...] (up to 5)}.
+        # top_track/top_album/top_artist are just each list's own first
+        # entry - kept alongside the lists so a caller that only wants
+        # the single favorite doesn't need to know that convention.
+        stats = {
+            "total_plays": 0,
+            "unique_tracks": 0,
+            "total_listening_ms": 0,
+            "tracking_since_ts": None,
+            "avg_plays_per_day": 0.0,
+            "busiest_day": None,
+            "longest_streak_days": 0,
+            "library_album_count": len(self.sorted_album_keys),
+            "library_artist_count": len(self._artist_groups()),
+            "library_track_count": sum(len(self.album_tracks.get(k, [])) for k in self.sorted_album_keys),
+            "top_track": None,
+            "top_album": None,
+            "top_artist": None,
+            "top_tracks": [],
+            "top_albums": [],
+            "top_artists": [],
+        }
+
+        records = self.get_recent_plays()
+        stats["total_plays"] = len(records)
+        if not records:
+            return stats
+
+        track_counts: dict[str, int] = {}
+        album_counts: dict[str, int] = {}
+        # normalized artist name -> [display name, count] - a plain dict
+        # keyed by the lowercased name so tag-casing variants of the same
+        # artist (see primary_artist_name) merge into one count instead
+        # of splitting it, the same rule _artist_groups() applies for the
+        # Artists tab.
+        artist_counts: dict[str, list] = {}
+        # "YYYY-MM-DD" (local calendar day) -> play count, for the
+        # Busiest Day and Longest Streak stats below - a play just after
+        # midnight and one just before it on the same night are different
+        # calendar days on purpose, the same way a person would count
+        # them.
+        day_counts: dict[str, int] = {}
+        earliest_ts = None
+
+        for record in records:
+            ts = record.get("ts")
+            if ts is not None:
+                if earliest_ts is None or ts < earliest_ts:
+                    earliest_ts = ts
+                day_key = time.strftime("%Y-%m-%d", time.localtime(ts))
+                day_counts[day_key] = day_counts.get(day_key, 0) + 1
+
+            path = record.get("path")
+            if not path or not os.path.exists(path):
+                continue
+            track_counts[path] = track_counts.get(path, 0) + 1
+
+            album_key = record.get("album_key")
+            if not album_key or album_key.startswith("__mix__"):
+                continue
+            album_counts[album_key] = album_counts.get(album_key, 0) + 1
+
+            meta = self.album_display_meta.get(album_key)
+            if meta and meta.get("artist"):
+                artist_name = primary_artist_name(meta["artist"])
+                norm = artist_name.lower()
+                bucket = artist_counts.get(norm)
+                if bucket is None:
+                    artist_counts[norm] = [artist_name, 1]
+                else:
+                    bucket[1] += 1
+
+        stats["unique_tracks"] = len(track_counts)
+        stats["tracking_since_ts"] = earliest_ts
+        # Same source as get_artist_stats() now uses - a continuous,
+        # exact ledger of real elapsed playback time
+        # (_accumulate_listening_time), not "duration × qualifying play
+        # count". Summed across every track in the current library
+        # (same sorted_album_keys enumeration library_track_count above
+        # uses) rather than the whole track_listening_ms dict as-is, so
+        # a track that's since been removed from the library doesn't
+        # keep contributing a stale total forever.
+        stats["total_listening_ms"] = sum(
+            self.track_listening_ms.get(path, 0)
+            for key in self.sorted_album_keys
+            for path in self.album_tracks.get(key, [])
+        )
+
+        # --- Top 5 songs ---------------------------------------------
+        ranked_tracks = sorted(track_counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
+        for path, count in ranked_tracks:
+            album_key = self.track_to_album_key.get(path)
+            meta = self.album_display_meta.get(album_key) if album_key else None
+            artist = meta["artist"] if meta else "Unknown Artist"
+            stats["top_tracks"].append((self.get_track_title(path), artist, count))
+        if stats["top_tracks"]:
+            stats["top_track"] = stats["top_tracks"][0]
+
+        # --- Top 5 albums ----------------------------------------------
+        ranked_albums = sorted(album_counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
+        for album_key, count in ranked_albums:
+            meta = self.album_display_meta.get(album_key)
+            if meta:
+                stats["top_albums"].append((meta["title"], meta["artist"], count))
+        if stats["top_albums"]:
+            stats["top_album"] = stats["top_albums"][0]
+
+        # --- Top 5 artists -----------------------------------------------
+        ranked_artists = sorted(artist_counts.values(), key=lambda v: v[1], reverse=True)[:5]
+        stats["top_artists"] = [(name, count) for name, count in ranked_artists]
+        if stats["top_artists"]:
+            stats["top_artist"] = stats["top_artists"][0]
+
+        # --- Busiest day -----------------------------------------------
+        if day_counts:
+            busiest_day_key, busiest_count = max(day_counts.items(), key=lambda kv: kv[1])
+            busiest_display = time.strftime("%b %d", time.strptime(busiest_day_key, "%Y-%m-%d"))
+            stats["busiest_day"] = (busiest_display, busiest_count)
+
+        # --- Longest streak (consecutive calendar days with a play) -----
+        if day_counts:
+            all_days = sorted(time.mktime(time.strptime(d, "%Y-%m-%d")) for d in day_counts.keys())
+            longest = current = 1
+            for i in range(1, len(all_days)):
+                # Rounded rather than compared for an exact 86400s gap -
+                # a clock-change day is a hair under or over 24 real
+                # hours, which would otherwise wrongly break an actually-
+                # unbroken streak right on that one day.
+                gap_days = round((all_days[i] - all_days[i - 1]) / 86400)
+                if gap_days == 1:
+                    current += 1
+                    longest = max(longest, current)
+                elif gap_days > 1:
+                    current = 1
+            stats["longest_streak_days"] = longest
+
+        # --- Average plays per day, since the very first logged play -----
+        if earliest_ts is not None:
+            days_tracking = max(1, (int(time.time()) - earliest_ts) // 86400 + 1)
+            stats["avg_plays_per_day"] = stats["total_plays"] / days_tracking
+
+        return stats
+
+    def get_artist_stats(self, artist_name: str) -> dict:
+        # Personal, all-time listening stats scoped to one artist - powers
+        # the "Your Stats" card on the artist detail banner. total_plays/
+        # first_played_ts/top_track come from play_history.jsonl (same as
+        # get_fun_stats()); total_listening_ms comes from track_listening_ms
+        # instead - a continuous, exact ledger of real elapsed playback
+        # time (see _accumulate_listening_time), deliberately independent
+        # of play_history's own 30-second/half-track "does this count as
+        # a play at all" threshold. A song skipped after 10 seconds still
+        # contributes those 10 real seconds here, even though it never
+        # became a counted "play".
+        #
+        # Returns {"total_plays", "total_listening_ms", "first_played_ts",
+        # "top_track": (title, count) or None}.
+        stats = {
+            "total_plays": 0,
+            "total_listening_ms": 0,
+            "first_played_ts": None,
+            "top_track": None,
+        }
+        norm = primary_artist_name(artist_name).lower()
+        matching_album_keys = {
+            key for key in self.sorted_album_keys
+            if self.album_display_meta.get(key)
+            and primary_artist_name(self.album_display_meta[key]["artist"]).lower() == norm
+        }
+        if not matching_album_keys:
+            return stats
+
+        stats["total_listening_ms"] = sum(
+            self.track_listening_ms.get(path, 0)
+            for key in matching_album_keys
+            for path in self.album_tracks.get(key, [])
+        )
+
+        track_counts: dict[str, int] = {}
+        earliest_ts = None
+        for record in self.get_recent_plays():
+            if record.get("album_key") not in matching_album_keys:
+                continue
+            ts = record.get("ts")
+            if ts is not None and (earliest_ts is None or ts < earliest_ts):
+                earliest_ts = ts
+            path = record.get("path")
+            if not path or not os.path.exists(path):
+                continue
+            track_counts[path] = track_counts.get(path, 0) + 1
+            stats["total_plays"] += 1
+
+        stats["first_played_ts"] = earliest_ts
+        if track_counts:
+            top_path, top_count = max(track_counts.items(), key=lambda kv: kv[1])
+            stats["top_track"] = (self.get_track_title(top_path), top_count)
+
+        return stats
 
     def get_recently_added_albums(self, limit: int = 12) -> list:
         # Local stand-in for "new releases" - sorted by folder mtime (see
@@ -10501,6 +11634,37 @@ class AdaptiveMusicPlayer(QMainWindow):
             self._refresh_playlist_detail_now_playing()
 
 # ------------------------------------------------------------ Playback --
+    def set_sleep_timer(self, option):
+        # option is None ("Off"), an int number of minutes, or the string
+        # "track_end" ("End of current track") - see the Options > Sleep
+        # Timer submenu above.
+        self._sleep_timer.stop()
+        self._sleep_at_track_end = False
+        if option is None:
+            self.status_label.setText("Sleep timer turned off")
+        elif option == "track_end":
+            self._sleep_at_track_end = True
+            self.status_label.setText("Playback will pause at the end of this track")
+        else:
+            self._sleep_timer.start(option * 60 * 1000)
+            self.status_label.setText(f"Sleep timer set for {option} minutes")
+        self.status_label.setVisible(True)
+
+    def _reset_sleep_timer_menu_to_off(self):
+        # Called once a sleep timer actually fires (or the "end of track"
+        # option triggers) so the Options menu doesn't keep showing a
+        # timer as active when it's already done its job.
+        off_action = self._sleep_timer_actions.get(None)
+        if off_action is not None:
+            off_action.setChecked(True)
+
+    def _pause_for_sleep_timer(self):
+        self._reset_sleep_timer_menu_to_off()
+        if self.is_playing:
+            self.toggle_play()
+        self.status_label.setText("Sleep timer elapsed \u2014 playback paused")
+        self.status_label.setVisible(True)
+
     def toggle_play(self):
         if self.player.source().isEmpty():
             if self.play_queue:
@@ -10601,6 +11765,16 @@ class AdaptiveMusicPlayer(QMainWindow):
             # Clean out terminated threads safely from memory lists
             self.lfm_async_threads = [t for t in self.lfm_async_threads if t.isRunning()]
 
+            if self._sleep_at_track_end:
+                # Sleep Timer was set to "End of current track" - stop
+                # right here instead of falling into the repeat/advance
+                # logic below (this track already finished normally and
+                # got scrobbled above like any other, it just doesn't get
+                # followed by another one).
+                self._sleep_at_track_end = False
+                QTimer.singleShot(0, self._pause_for_sleep_timer)
+                return
+
             # Handle repeating the same track or advancing forward using QTimer single shots.
             # This yields execution back to the Qt loop to cleanly dismantle the old media stream.
             if self.playback_mode == 2:
@@ -10624,7 +11798,80 @@ class AdaptiveMusicPlayer(QMainWindow):
         # Seek bar/time label always reflect true local position; only the
         # lyric view gets the Chromecast delay compensation applied.
         self.sync_lyrics_scroll(self._lyric_sync_position(position))
-        self._maybe_log_play(position)
+        # Accumulation first - _maybe_log_play now checks
+        # _current_track_elapsed_listened_ms, which this tick is what
+        # actually updates.
+        self._accumulate_listening_time(position)
+        self._maybe_log_play()
+
+    def _accumulate_listening_time(self, position_ms: int):
+        # Tracks genuine elapsed listening time per track, live and
+        # exactly - real accumulated milliseconds, second by second, the
+        # same way a stopwatch would, rather than jumping in one lump
+        # once some threshold is crossed. Backs the artist page's live
+        # "Time Listened" ticker (_tick_live_artist_listening_time),
+        # get_artist_stats()'s own sum, and - via
+        # _current_track_elapsed_listened_ms - is also what
+        # _maybe_log_play checks to decide whether this playthrough
+        # counts as a "play" at all.
+        if not self.is_playing or self.current_track_index == -1 or not self.active_playing_tracks:
+            self._listening_time_last_position = None
+            self._listening_time_last_path = None
+            return
+
+        path = self.active_playing_tracks[self.current_track_index]
+        last_position = self._listening_time_last_position
+        last_path = self._listening_time_last_path
+
+        if last_path == path and last_position is not None:
+            delta = position_ms - last_position
+            # Only counts genuine forward playback progress - a seek
+            # (backward, or a big forward jump from dragging the
+            # timeline/skipping) doesn't mean the skipped-over span was
+            # actually heard, the same way scrubbing a stopwatch forward
+            # doesn't make time pass faster. 2s is generous room above
+            # this signal's normal tick rate while still well under the
+            # smallest seek anyone would realistically make. This is
+            # exactly what keeps a skip-straight-to-40-seconds from
+            # counting as a play below - jumping past the threshold this
+            # way never adds a matching delta here, so
+            # _current_track_elapsed_listened_ms never actually reaches
+            # it.
+            if 0 < delta <= 2000:
+                self.track_listening_ms[path] = self.track_listening_ms.get(path, 0) + delta
+                self._listening_time_dirty = True
+                self._current_track_elapsed_listened_ms += delta
+                self._tick_live_artist_listening_time(path, delta)
+
+        self._listening_time_last_position = position_ms
+        self._listening_time_last_path = path
+
+    def _tick_live_artist_listening_time(self, path: str, delta_ms: int):
+        # Cheap live nudge for the artist page's "Time Listened" tile -
+        # adds just this tick's delta onto a baseline already computed
+        # once (see _refresh_artist_your_stats), rather than re-running
+        # get_artist_stats()'s full play-history/library scan on every
+        # position tick, which fires many times a second during
+        # playback. RollingStatLabel itself already no-ops unless the
+        # displayed (whole-minute) value actually changes, so this can
+        # be called on every tick without the UI actually re-animating
+        # more often than the number on screen truly moves.
+        if not self.artist_filter_name:
+            return
+        album_key = self.track_to_album_key.get(path)
+        meta = self.album_display_meta.get(album_key) if album_key else None
+        if not meta or primary_artist_name(meta.get("artist", "")).lower() != primary_artist_name(self.artist_filter_name).lower():
+            return
+        if not self.artist_detail_stats_card.isVisible():
+            # First-ever listening for this artist just started - do one
+            # real refresh now (cheap enough, happens at most once per
+            # artist) rather than waiting for the periodic/track-change
+            # refresh to eventually reveal the card.
+            self._refresh_artist_your_stats(self.artist_filter_name, animate=False)
+            return
+        self._artist_live_listening_delta_ms += delta_ms
+        total_ms = self._artist_live_listening_baseline_ms + self._artist_live_listening_delta_ms
+        self.artist_detail_time_value.set_duration_ms(total_ms, animate=True)
 
     def update_timeline_duration(self, duration: int):
         self.timeline_slider.setRange(0, duration)
@@ -10687,6 +11934,18 @@ class AdaptiveMusicPlayer(QMainWindow):
     def on_timeline_moved(self, position: int):
         self.time_elapsed_lbl.setText(format_time(position))
         self.player.setPosition(position)
+
+    def _seek_by(self, delta_ms: int):
+        # Backs the Left/Right keyboard shortcuts - reuses the exact same
+        # commit path a mouse-dragged seek already goes through
+        # (on_timeline_released), so MPRIS and any active Chromecast
+        # session stay in sync the same way, instead of duplicating that
+        # logic here.
+        if self.timeline_slider.maximum() <= 0:
+            return  # nothing loaded/seekable yet
+        new_position = max(0, min(self.timeline_slider.maximum(), self.player.position() + delta_ms))
+        self.timeline_slider.setValue(new_position)
+        self.on_timeline_released()
 
     def _animate_label_emphasis(self, label: QLabel, state_key: str, adjusting: bool,
                                  rest_alpha: float = 0.6, extra_css: str = ""):
@@ -10756,10 +12015,78 @@ class AdaptiveMusicPlayer(QMainWindow):
             except Exception as e:
                 print(f"[Chromecast] set_volume() raised: {e}")  # Debug
 
+    def _adjust_volume_by(self, delta: int):
+        # Backs the Up/Down keyboard shortcuts. Just moves the slider -
+        # its existing valueChanged connection to change_volume() already
+        # handles the audio output, MPRIS notification, Chromecast mirror,
+        # and settings persistence, so there's nothing extra to do here.
+        new_value = max(0, min(100, self.volume_slider.value() + delta))
+        self.volume_slider.setValue(new_value)
+
+    def toggle_mute(self):
+        # Backs the M keyboard shortcut. Remembers the volume from right
+        # before muting (see _pre_mute_volume_pct) so pressing M again
+        # restores exactly where it was, rather than jumping to some
+        # arbitrary fixed level.
+        if self.volume_slider.value() > 0:
+            self._pre_mute_volume_pct = self.volume_slider.value()
+            self.volume_slider.setValue(0)
+        else:
+            self.volume_slider.setValue(self._pre_mute_volume_pct or 30)
+
     def changeEvent(self, event):
         super().changeEvent(event)
         if event.type() == QEvent.Type.WindowStateChange:
             self._update_size_grip_visibility()
+
+    # -------------------------------------------------------- Drag & drop --
+    def dragEnterEvent(self, event):
+        # Only reached when nothing under the cursor claimed the drag
+        # itself (a playlist card's own dragEnterEvent handles landing
+        # directly on it - see AlbumCardWidget) - anywhere else in the
+        # window, a dropped file/folder queues up instead.
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        paths = self._resolve_dropped_audio_paths(event.mimeData().urls())
+        if not paths:
+            self.status_label.setText("No supported audio files in that drop")
+            self.status_label.setVisible(True)
+            return
+        self.add_tracks_to_queue(paths)
+        event.acceptProposedAction()
+
+    def _resolve_dropped_audio_paths(self, urls: list) -> list:
+        # Shared by dropping onto the window (queues everything) and onto
+        # a playlist card (adds everything to that playlist) -
+        # a dropped folder is walked the same way LibraryScanner walks a
+        # chosen library folder, so dropping an album folder in behaves
+        # just like dropping the individual files inside it would.
+        paths = []
+        for url in urls:
+            if not url.isLocalFile():
+                continue
+            local_path = url.toLocalFile()
+            if os.path.isdir(local_path):
+                for root, _dirs, files in os.walk(local_path):
+                    for name in sorted(files):
+                        if os.path.splitext(name)[1].lower() in SUPPORTED_EXTENSIONS:
+                            paths.append(os.path.join(root, name))
+            elif os.path.splitext(local_path)[1].lower() in SUPPORTED_EXTENSIONS:
+                paths.append(local_path)
+        return paths
+
+    def handle_files_dropped_on_playlist(self, playlist_id: str, urls: list):
+        paths = self._resolve_dropped_audio_paths(urls)
+        if not paths:
+            self.status_label.setText("No supported audio files in that drop")
+            self.status_label.setVisible(True)
+            return
+        # add_tracks_to_playlist already sets its own "Added N tracks to
+        # ..." status message on success, so there's nothing more to do
+        # here on the happy path.
+        self.add_tracks_to_playlist(playlist_id, paths)
 
     def _update_size_grip_visibility(self):
         # A resize handle doesn't make sense once the window is
