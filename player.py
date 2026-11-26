@@ -128,7 +128,7 @@ ARTIST_STATS_MAX_AGE_SECONDS = 1 * 86400
 ARTIST_BIO_MAX_AGE_SECONDS = 90 * 86400
 ORG_NAME = "RoPlayer"
 APP_NAME = "RoPlayer"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 APP_REPO_URL = "https://github.com/rohanisawesome/RoPlayer"
 
 # --------------------------------------------------------------------------
@@ -3939,6 +3939,25 @@ class TopSongsHighlightOverlay(QWidget):
         self.hide()
 
 
+class _RepeatAwareMediaController(MediaController):
+    # pychromecast doesn't parse the speaker's repeat mode out of its media
+    # status - catch it from the raw message instead, so "Hey Google, put
+    # this song on repeat / turn off repeat" can be mirrored in RoPlayer.
+    def __init__(self, on_repeat_mode=None):
+        super().__init__()
+        self.on_repeat_mode = on_repeat_mode
+
+    def receive_message(self, message, data):
+        try:
+            if data.get("type") == "MEDIA_STATUS" and data.get("status") and self.on_repeat_mode:
+                status = data["status"][0]
+                if "repeatMode" in status:
+                    self.on_repeat_mode(str(status["repeatMode"]))
+        except Exception:
+            pass
+        return super().receive_message(message, data)
+
+
 class AdaptiveMusicPlayer(QMainWindow):
     chromecast_devices_found = pyqtSignal(list)
     chromecast_scan_failed = pyqtSignal(str)
@@ -3950,6 +3969,7 @@ class AdaptiveMusicPlayer(QMainWindow):
     chromecast_seek_failed = pyqtSignal(str, int)  # path, position_ms - fall back to a full reload there
     chromecast_player_state = pyqtSignal(str, str, str, float)  # player_state, idle_reason, content_id, current_time (s)
     chromecast_volume_changed = pyqtSignal(float)  # speaker volume 0.0-1.0, however it was changed
+    chromecast_repeat_mode = pyqtSignal(str)  # REPEAT_OFF / REPEAT_ALL / REPEAT_SINGLE, as the speaker reports it
     mprisArtReady = pyqtSignal()  # fires whenever a background art write finishes
     mprisServiceReady = pyqtSignal()
 
@@ -4400,6 +4420,8 @@ class AdaptiveMusicPlayer(QMainWindow):
         self._cast_last_command_ts = 0.0
         self._suppress_cast_commands = False  # True while mirroring a pause/play that came from the speaker
         self.chromecast_volume_changed.connect(self._handle_chromecast_volume_changed)
+        self.chromecast_repeat_mode.connect(self._handle_chromecast_repeat_mode)
+        self._cast_repeat_mode_sent = None
         self._suppress_cast_volume = False
         self._cast_last_volume_set_ts = 0.0
         # The small queue kept on the speaker (previous, current, next...)
@@ -11105,7 +11127,7 @@ class AdaptiveMusicPlayer(QMainWindow):
             # window freezes (and, if it also raises, can hard-crash Qt).
             try:
                 cast.wait()
-                media_controller = MediaController()
+                media_controller = _RepeatAwareMediaController(on_repeat_mode=self.chromecast_repeat_mode.emit)
                 cast.register_handler(media_controller)
 
                 # play_media() only *sends* a load request - it doesn't tell us
@@ -11253,14 +11275,44 @@ class AdaptiveMusicPlayer(QMainWindow):
         self._speaker_moved_to_url = url
         try:
             if direction > 0:
-                if self.playback_mode == 2:
-                    self.play_track_at(self.current_track_index)
-                else:
-                    self.play_next()
+                self.play_next()
             else:
                 self._go_to_previous_track()
         finally:
             self._speaker_moved_to_url = None
+
+    @staticmethod
+    def _speaker_repeat_mode_for(mode: int) -> str:
+        # RoPlayer's modes: 0 off, 1 repeat all, 2 repeat one, 3 shuffle.
+        return {1: "REPEAT_ALL", 2: "REPEAT_SINGLE"}.get(mode, "REPEAT_OFF")
+
+    def _handle_chromecast_repeat_mode(self, speaker_mode: str):
+        # "Hey Google, put this song on repeat / repeat / turn off repeat"
+        # (or the Home app) changed the speaker's repeat mode.
+        if not self.chromecast_device or self._cast_loaded_path is None:
+            return
+        if speaker_mode == self._cast_repeat_mode_sent:
+            return  # what we already told it
+        now = time.monotonic()
+        if now - self._cast_last_command_ts < 2.0 or now - self._cast_load_started < 3.0:
+            return  # stale status from before our own change landed
+        self._cast_repeat_mode_sent = speaker_mode
+        if speaker_mode == "REPEAT_SINGLE":
+            new_mode = 2
+        elif speaker_mode.startswith("REPEAT_ALL"):
+            new_mode = 1
+        elif speaker_mode == "REPEAT_OFF" and self.playback_mode in (1, 2):
+            new_mode = 0
+        else:
+            return
+        if new_mode == self.playback_mode:
+            return
+        print(f"[Chromecast] Repeat changed on the speaker ({speaker_mode}) - following")  # Debug
+        self._suppress_cast_commands = True
+        try:
+            self.set_playback_mode(new_mode)
+        finally:
+            self._suppress_cast_commands = False
 
     def _handle_chromecast_volume_changed(self, level: float):
         # Volume changed on the speaker - "Hey Google, volume 50%", its
@@ -11290,8 +11342,6 @@ class AdaptiveMusicPlayer(QMainWindow):
 
     def _peek_next_path(self):
         # What play_next() would play, without playing it.
-        if 0 <= self.current_track_index < len(self.active_playing_tracks) and self.playback_mode == 2:
-            return self.active_playing_tracks[self.current_track_index]
         for path in list(self.play_queue[:1]) + self._compute_upcoming_context_tracks():
             if os.path.exists(path):
                 return path
@@ -11729,11 +11779,12 @@ class AdaptiveMusicPlayer(QMainWindow):
                     "items": items,
                     "startIndex": start_index,
                     "currentTime": max(0, start_position_ms) / 1000.0,
-                    "repeatMode": "REPEAT_OFF",
+                    "repeatMode": self._speaker_repeat_mode_for(self.playback_mode),
                 },
                 inc_session_id=True,
                 callback_function=_on_load_result,
             )
+            self._cast_repeat_mode_sent = self._speaker_repeat_mode_for(self.playback_mode)
             print(f"[Chromecast] Queue sent ({len(items)} songs), playing: {title}")  # Debug
         except Exception as e:
             self.status_label.setText(f"Cast error: {e}")
@@ -12300,6 +12351,11 @@ class AdaptiveMusicPlayer(QMainWindow):
             "LoopStatus": {0: "None", 1: "Playlist", 2: "Track"}.get(mode, "None"),
             "Shuffle": mode == 3,
         })
+        speaker_mode = self._speaker_repeat_mode_for(mode)
+        if (self.chromecast_device and self._cast_loaded_path is not None
+                and not self._suppress_cast_commands and speaker_mode != self._cast_repeat_mode_sent):
+            self._cast_repeat_mode_sent = speaker_mode
+            self._send_cast_media_command({"type": "QUEUE_UPDATE", "repeatMode": speaker_mode})
         # Mode changes don't go through play_track_at, which is what
         # normally keeps the Queue view's "Next from X" preview live -
         # without this, switching modes while that view is open wouldn't
@@ -12331,6 +12387,18 @@ class AdaptiveMusicPlayer(QMainWindow):
                 # followed by another one).
                 self._sleep_at_track_end = False
                 QTimer.singleShot(0, self._pause_for_sleep_timer)
+                return
+
+            if self.playback_mode == 2 and self.chromecast_device and self._cast_loaded_path is not None:
+                # Repeat-one while casting: the speaker loops the song by
+                # itself (its repeat mode is REPEAT_SINGLE), gaplessly -
+                # just restart the muted local copy alongside it, without
+                # reloading it on the speaker.
+                self._speaker_moved_to_url = self._cast_loaded_url
+                try:
+                    self.play_track_at(self.current_track_index)
+                finally:
+                    self._speaker_moved_to_url = None
                 return
 
             if self._cast_has_queued_next():

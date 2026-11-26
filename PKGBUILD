@@ -1,5 +1,5 @@
 pkgname=roplayer
-pkgver=1.2.0
+pkgver=1.2.1
 pkgrel=1
 pkgdesc="RoPlayer - a desktop music player for Linux built with PyQt6"
 arch=('any')
