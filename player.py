@@ -128,7 +128,7 @@ ARTIST_STATS_MAX_AGE_SECONDS = 1 * 86400
 ARTIST_BIO_MAX_AGE_SECONDS = 90 * 86400
 ORG_NAME = "RoPlayer"
 APP_NAME = "RoPlayer"
-APP_VERSION = "1.1.13"
+APP_VERSION = "1.2.0"
 APP_REPO_URL = "https://github.com/rohanisawesome/RoPlayer"
 
 # --------------------------------------------------------------------------
@@ -3949,6 +3949,7 @@ class AdaptiveMusicPlayer(QMainWindow):
     chromecast_load_failed = pyqtSignal(str, bool, str)  # path that failed to load, already retried?, reason
     chromecast_seek_failed = pyqtSignal(str, int)  # path, position_ms - fall back to a full reload there
     chromecast_player_state = pyqtSignal(str, str, str, float)  # player_state, idle_reason, content_id, current_time (s)
+    chromecast_volume_changed = pyqtSignal(float)  # speaker volume 0.0-1.0, however it was changed
     mprisArtReady = pyqtSignal()  # fires whenever a background art write finishes
     mprisServiceReady = pyqtSignal()
 
@@ -4384,7 +4385,7 @@ class AdaptiveMusicPlayer(QMainWindow):
         self.local_http_server = None
         self.local_server_thread = None
         self.local_server_port = 8010
-        self._cast_served_files = {}  # URL token -> local path; the only files the cast server will hand out
+        self._cast_served_files = {}  # URL token -> local path; only the songs in the speaker's queue
         self._cast_loaded_path = None  # track the Chromecast currently has loaded, if any
         self.chromecast_devices_found.connect(self._show_chromecast_device_menu)
         self.chromecast_scan_failed.connect(self._handle_chromecast_scan_failure)
@@ -4398,6 +4399,16 @@ class AdaptiveMusicPlayer(QMainWindow):
         self._cast_loaded_url = None
         self._cast_last_command_ts = 0.0
         self._suppress_cast_commands = False  # True while mirroring a pause/play that came from the speaker
+        self.chromecast_volume_changed.connect(self._handle_chromecast_volume_changed)
+        self._suppress_cast_volume = False
+        self._cast_last_volume_set_ts = 0.0
+        # The small queue kept on the speaker (previous, current, next...)
+        # so "Hey Google, next/previous song" and the Google Home app's
+        # skip buttons have somewhere to go - see cast_current_track.
+        self._cast_queue_urls = []   # in speaker queue order
+        self._cast_url_paths = {}    # url -> local path, for every item in that queue
+        self._speaker_moved_to_url = None  # set while following a skip the speaker made itself
+        self._track_change_counter = 0
         self._cast_load_started = 0.0
 
         # --- Chromecast lyric-sync delay compensation -----------------------
@@ -9550,6 +9561,7 @@ class AdaptiveMusicPlayer(QMainWindow):
             return
 
         self.current_track_index = row
+        self._track_change_counter += 1
         self._load_lyrics_for_track(path)
         if self.playback_mode == 3 and self.active_playing_album_key != self.QUEUE_KEY:
             # Keeps shuffle_order valid for whatever's actually playing
@@ -9802,6 +9814,12 @@ class AdaptiveMusicPlayer(QMainWindow):
             self._mpris_notify_seeked()
             self._queue_chromecast_seek(0)
             return
+        self._go_to_previous_track()
+
+    def _go_to_previous_track(self):
+        # The actual "go back one track" step of play_previous, without its
+        # restart-if-past-3-seconds rule - also used when the speaker
+        # itself went back ("Hey Google, previous song").
         if self.playback_mode == 3 and self.active_playing_album_key != self.QUEUE_KEY:
             # Walks shuffle_order backwards, mirroring play_next()'s
             # forward walk - using plain current_track_index - 1 here
@@ -11115,6 +11133,8 @@ class AdaptiveMusicPlayer(QMainWindow):
                 class _CastAppListener:
                     def new_cast_status(_self, status):
                         self.chromecast_app_changed.emit(status.app_id or "", status.display_name or "")
+                        if status.volume_level is not None:
+                            self.chromecast_volume_changed.emit(float(status.volume_level))
                 cast.register_status_listener(_CastAppListener())
 
                 self.chromecast_connected.emit((cast, media_controller))
@@ -11137,6 +11157,10 @@ class AdaptiveMusicPlayer(QMainWindow):
         # Match the speaker's volume to the current slider position, rather
         # than leaving it at whatever it happened to already be set to.
         try:
+            # Counts as our own change, so the speaker's old volume (still
+            # in flight in its status updates) isn't copied back onto the
+            # slider - see _handle_chromecast_volume_changed.
+            self._cast_last_volume_set_ts = time.monotonic()
             cast.set_volume(self.volume_slider.value() / 100.0)
         except Exception as e:
             print(f"[Chromecast] set_volume() on connect raised: {e}")  # Debug
@@ -11186,9 +11210,17 @@ class AdaptiveMusicPlayer(QMainWindow):
         # silent, or sit paused while the speaker plays.
         if not self.chromecast_device or self._cast_loaded_path is None:
             return
+        now = time.monotonic()
+        if (content_id and content_id != self._cast_loaded_url and content_id in self._cast_url_paths
+                and state in ("PLAYING", "BUFFERING", "PAUSED")
+                and now - self._cast_load_started >= 3.0):
+            # The speaker moved to another song in its queue by itself -
+            # "Hey Google, next/previous song", the Google Home app, or
+            # just reaching the end of the current one.
+            self._on_speaker_moved_to(content_id)
+            return
         if not content_id or content_id != self._cast_loaded_url:
             return  # a status about some other/older media
-        now = time.monotonic()
         # The speaker echoes our own commands back, and reports
         # IDLE/BUFFERING while a load starts - only act on changes we
         # didn't just cause ourselves.
@@ -11208,6 +11240,125 @@ class AdaptiveMusicPlayer(QMainWindow):
             print("[Chromecast] Stopped on the speaker - pausing RoPlayer")  # Debug
             self._mirror_speaker_play_state(playing=False, position_ms=None)
             self._cast_loaded_path = None
+
+    def _on_speaker_moved_to(self, url: str):
+        try:
+            direction = 1 if self._cast_queue_urls.index(url) > self._cast_queue_urls.index(self._cast_loaded_url) else -1
+        except ValueError:
+            direction = 1
+        print(f"[Chromecast] Speaker skipped {'forward' if direction > 0 else 'back'} - following")  # Debug
+        # cast_current_track sees this and, if RoPlayer lands on the same
+        # song the speaker is already playing, leaves it playing instead
+        # of reloading it.
+        self._speaker_moved_to_url = url
+        try:
+            if direction > 0:
+                if self.playback_mode == 2:
+                    self.play_track_at(self.current_track_index)
+                else:
+                    self.play_next()
+            else:
+                self._go_to_previous_track()
+        finally:
+            self._speaker_moved_to_url = None
+
+    def _handle_chromecast_volume_changed(self, level: float):
+        # Volume changed on the speaker - "Hey Google, volume 50%", its
+        # buttons, the Home app. Our own set_volume() calls echo back here
+        # too (and, mid-drag, with older values), so skip those.
+        if not self.chromecast_device:
+            return
+        if time.monotonic() - self._cast_last_volume_set_ts < 1.5:
+            return
+        value = round(level * 100)
+        if value == self.volume_slider.value():
+            return
+        print(f"[Chromecast] Volume changed on the speaker to {value}%")  # Debug
+        self._suppress_cast_volume = True
+        try:
+            self.volume_slider.setValue(value)
+        finally:
+            self._suppress_cast_volume = False
+
+    def _cast_has_queued_next(self) -> bool:
+        if not (self.chromecast_device and self._cast_loaded_path is not None):
+            return False
+        try:
+            return self._cast_queue_urls.index(self._cast_loaded_url) + 1 < len(self._cast_queue_urls)
+        except ValueError:
+            return False
+
+    def _peek_next_path(self):
+        # What play_next() would play, without playing it.
+        if 0 <= self.current_track_index < len(self.active_playing_tracks) and self.playback_mode == 2:
+            return self.active_playing_tracks[self.current_track_index]
+        for path in list(self.play_queue[:1]) + self._compute_upcoming_context_tracks():
+            if os.path.exists(path):
+                return path
+        return None
+
+    def _peek_previous_path(self):
+        # What _go_to_previous_track() would play, without playing it.
+        tracks = self.active_playing_tracks
+        if self.active_playing_album_key == self.QUEUE_KEY:
+            return None
+        if self.playback_mode == 3:
+            self._ensure_shuffle_order()
+            if self.shuffle_position > 0:
+                index = self.shuffle_order[self.shuffle_position - 1]
+                return tracks[index] if 0 <= index < len(tracks) else None
+            return None
+        if self.current_track_index > 0:
+            return tracks[self.current_track_index - 1]
+        return None
+
+    def _cast_queue_item(self, path: str, autoplay: bool = True) -> tuple:
+        # (url, queue item) for one song - registers it with the cast
+        # server under a fresh random token.
+        filename = os.path.basename(path)
+        token = secrets.token_urlsafe(16)
+        self._cast_served_files[token] = path
+        url = f"http://{self._get_lan_ip()}:{self.local_server_port}/{token}/{urllib.parse.quote(filename)}"
+        self._cast_url_paths[url] = path
+        artist, album, _, _ = read_track_tags(path)
+        # The real type of this file - always claiming audio/mpeg made the
+        # receiver reject or choke on anything that isn't actually an MP3
+        # (.m4a especially).
+        content_type = mimetypes.guess_type(filename)[0] or "audio/mpeg"
+        if filename.lower().endswith(".m4a"):
+            content_type = "audio/mp4"
+        item = {
+            "media": {
+                "contentId": url,
+                "contentType": content_type,
+                # pychromecast defaults to "LIVE" (internet radio). These
+                # are finite files - "BUFFERED" lets the speaker buffer
+                # less and start, seek and pause like normal media.
+                "streamType": "BUFFERED",
+                "metadata": {
+                    "metadataType": 3,  # MetadataType.MUSIC_TRACK
+                    "title": self.get_track_title(path),
+                    "artist": artist,
+                    "albumName": album or "",
+                },
+            },
+            "autoplay": autoplay,
+            "preloadTime": 15,  # start fetching the next song before this one ends
+            "startTime": 0,
+        }
+        return url, item
+
+    def _append_cast_next(self):
+        # After the speaker moved on by itself, top its queue back up with
+        # whatever comes after the new current song.
+        if self._cast_has_queued_next():
+            return
+        next_path = self._peek_next_path()
+        if not next_path:
+            return
+        url, item = self._cast_queue_item(next_path)
+        self._cast_queue_urls.append(url)
+        self._send_cast_media_command({"type": "QUEUE_INSERT", "items": [item]})
 
     def _mirror_speaker_play_state(self, playing: bool, position_ms):
         if position_ms is not None and position_ms > 0:
@@ -11290,6 +11441,8 @@ class AdaptiveMusicPlayer(QMainWindow):
 
     def _stop_local_http_server(self):
         self._cast_served_files = {}
+        self._cast_url_paths = {}
+        self._cast_queue_urls = []
         self._cast_loaded_path = None
         if self.local_http_server:
             server = self.local_http_server
@@ -11494,71 +11647,97 @@ class AdaptiveMusicPlayer(QMainWindow):
         self.chromecast_lyric_delay_ms = 0
 
         path = self.active_playing_tracks[self.current_track_index]
-        filename = os.path.basename(path)
-        # A fresh random token per track, and only the current track is
-        # servable - see start_local_http_server's Handler. The filename
-        # after it is just cosmetic (helps the receiver/logs), the server
-        # only looks at the token.
-        token = secrets.token_urlsafe(16)
-        self._cast_served_files = {token: path}
-        encoded_name = urllib.parse.quote(filename)
+        title = self.get_track_title(path)
 
-        local_ip = self._get_lan_ip()
-        url = f"http://{local_ip}:{self.local_server_port}/{token}/{encoded_name}"
+        # 1) The speaker already moved to this exact song itself (voice
+        #    command, Home app, or reaching the end of the last one) -
+        #    leave it playing, just catch up and top the queue up.
+        moved_url = self._speaker_moved_to_url
+        if moved_url and self._cast_url_paths.get(moved_url) == path:
+            self._cast_loaded_path = path
+            self._cast_loaded_url = moved_url
+            self._cast_load_started = time.monotonic()
+            self.status_label.setText(f"🎵 Casting: {title}")
+            self._append_cast_next()
+            return
+
+        # 2) RoPlayer itself skipped to the song right before/after the
+        #    current one in the speaker's queue - jump to it there, which
+        #    is faster than a fresh load (the next one is preloaded).
+        if start_position_ms <= 0 and not is_retry and self._cast_loaded_url in self._cast_queue_urls:
+            current_pos = self._cast_queue_urls.index(self._cast_loaded_url)
+            for jump in (1, -1):
+                neighbour = current_pos + jump
+                if 0 <= neighbour < len(self._cast_queue_urls) \
+                        and self._cast_url_paths.get(self._cast_queue_urls[neighbour]) == path:
+                    url = self._cast_queue_urls[neighbour]
+                    self._cast_loaded_path = path
+                    self._cast_loaded_url = url
+                    self._cast_load_started = time.monotonic()
+                    self.status_label.setText(f"🎵 Casting: {title}")
+                    print(f"[Chromecast] Jumping {jump:+d} in the speaker's queue to: {title}")  # Debug
+                    self._send_cast_media_command(
+                        {"type": "QUEUE_UPDATE", "jump": jump},
+                        on_failure=lambda p=path: self.chromecast_seek_failed.emit(p, 0),
+                    )
+                    if not self.is_playing:
+                        self._send_cast_media_command({"type": "PAUSE"})
+                    if jump > 0:
+                        self._append_cast_next()
+                    return
+
+        # 3) Otherwise load a fresh queue: previous, current, next. Having
+        #    a song on either side is what lets "Hey Google, next/previous
+        #    song" work at all, and lets the speaker move on to the next
+        #    one by itself without a gap.
+        self._cast_served_files = {}
+        self._cast_url_paths = {}
+        items, urls = [], []
+        prev_path = self._peek_previous_path()
+        if prev_path and os.path.exists(prev_path):
+            url, item = self._cast_queue_item(prev_path)
+            items.append(item); urls.append(url)
+        start_index = len(items)
+        url, item = self._cast_queue_item(path, autoplay=self.is_playing)
+        items.append(item); urls.append(url)
+        next_path = self._peek_next_path()
+        if next_path:
+            next_url, next_item = self._cast_queue_item(next_path)
+            items.append(next_item); urls.append(next_url)
+        self._cast_queue_urls = urls
         print(f"[Chromecast] Casting URL: {url}")  # Debug - try curl'ing this from another device
 
-        artist, album, _, _ = read_track_tags(path)
-        title = self.get_track_title(path)
-        # The real type of this file - always claiming audio/mpeg made the
-        # receiver reject or choke on anything that isn't actually an MP3
-        # (.m4a especially).
-        content_type = mimetypes.guess_type(filename)[0] or "audio/mpeg"
-        if filename.lower().endswith(".m4a"):
-            content_type = "audio/mp4"
+        def _on_load_result(ok, response, p=path, r=is_retry):
+            # Runs on pychromecast's thread. pychromecast otherwise drops
+            # failures silently - e.g. a stuck app on the speaker refusing
+            # to make way for our receiver, leaving us "connected" with
+            # nothing playing.
+            kind = (response or {}).get("type") if isinstance(response, dict) else None
+            if not ok or kind in ("LOAD_FAILED", "LOAD_CANCELLED", "INVALID_REQUEST"):
+                self.chromecast_load_failed.emit(p, r, str(response)[:300])
 
         try:
-            # Newer pychromecast versions (14.x) removed the artist= shortcut
-            # kwarg from play_media(); artist/album now go through a
-            # metadata dict instead.
             self._cast_loaded_path = path
             self._cast_loaded_url = url
             self._cast_load_started = time.monotonic()
-            # Set before play_media() - a failure callback can update the
+            # Set before sending - a failure callback can update the
             # status itself, and mustn't be overwritten by this afterwards.
             self.status_label.setText(f"🎵 Casting: {title}")
-            self.cast_media_controller.play_media(
-                url,
-                content_type=content_type,
-                # pychromecast defaults to "LIVE" (internet radio). These
-                # are finite files - "BUFFERED" lets the speaker buffer
-                # less and start, seek and pause like normal media.
-                stream_type="BUFFERED",
-                title=title,
-                current_time=max(0, start_position_ms) / 1000.0,
-                autoplay=self.is_playing,
-                metadata={
-                    "metadataType": 3,  # MetadataType.MUSIC_TRACK
-                    "title": title,
-                    "artist": artist,
-                    "albumName": album or "",
+            self.cast_media_controller.send_message(
+                {
+                    "type": "QUEUE_LOAD",
+                    "items": items,
+                    "startIndex": start_index,
+                    "currentTime": max(0, start_position_ms) / 1000.0,
+                    "repeatMode": "REPEAT_OFF",
                 },
-                # pychromecast otherwise drops failures silently - e.g. a
-                # stuck app on the speaker refusing to make way for our
-                # receiver, leaving us "connected" with nothing playing.
-                callback_function=lambda ok, resp, p=path, r=is_retry: (
-                    None if ok else self.chromecast_load_failed.emit(p, r, str(resp)[:300])
-                ),
+                inc_session_id=True,
+                callback_function=_on_load_result,
             )
-            print(f"[Chromecast] play_media() sent for: {title}")  # Debug
+            print(f"[Chromecast] Queue sent ({len(items)} songs), playing: {title}")  # Debug
         except Exception as e:
             self.status_label.setText(f"Cast error: {e}")
-            print(f"[Chromecast] play_media() raised: {e}")  # Debug
-
-
-
-
-
-
+            print(f"[Chromecast] queue load raised: {e}")  # Debug
 
     def _enter_detail_view(self, index: int, back_btn: QPushButton):
         # Only remember the tab if we're actually leaving one - if we're
@@ -12154,14 +12333,29 @@ class AdaptiveMusicPlayer(QMainWindow):
                 QTimer.singleShot(0, self._pause_for_sleep_timer)
                 return
 
-            # Handle repeating the same track or advancing forward using QTimer single shots.
-            # This yields execution back to the Qt loop to cleanly dismantle the old media stream.
-            if self.playback_mode == 2:
-                # Track Loop: safely reload and replay this exact item index on next tick
-                QTimer.singleShot(0, lambda: self.play_track_at(self.current_track_index))
-            else:
-                # Safely advance forward without stepping on the media backend thread context
-                QTimer.singleShot(0, self.play_next)
+            if self._cast_has_queued_next():
+                # Casting with the next song already queued on the speaker:
+                # it moves on by itself, gaplessly, a moment after this
+                # (muted) local copy ends - and RoPlayer follows when it
+                # does (see _on_speaker_moved_to). Only advance here if
+                # that hasn't happened within a few seconds.
+                counter = self._track_change_counter
+                QTimer.singleShot(5000, lambda c=counter: self._advance_after_track_end(c))
+                return
+
+            self._advance_after_track_end(self._track_change_counter)
+
+    def _advance_after_track_end(self, counter: int):
+        if counter != self._track_change_counter:
+            return  # already moved on (the speaker advanced, or the user skipped)
+        # Handle repeating the same track or advancing forward using QTimer single shots.
+        # This yields execution back to the Qt loop to cleanly dismantle the old media stream.
+        if self.playback_mode == 2:
+            # Track Loop: safely reload and replay this exact item index on next tick
+            QTimer.singleShot(0, lambda: self.play_track_at(self.current_track_index))
+        else:
+            # Safely advance forward without stepping on the media backend thread context
+            QTimer.singleShot(0, self.play_next)
 
 
     def handle_player_error(self, error, error_string: str):
@@ -12428,7 +12622,8 @@ class AdaptiveMusicPlayer(QMainWindow):
         # not casting). If we're also connected to a Chromecast, mirror the
         # same level there - cast volume is a property of the Chromecast
         # device itself (0.0-1.0), not the media controller.
-        if self.chromecast_device:
+        if self.chromecast_device and not self._suppress_cast_volume:
+            self._cast_last_volume_set_ts = time.monotonic()
             try:
                 self.chromecast_device.set_volume(value / 100.0)
             except Exception as e:
